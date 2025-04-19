@@ -7,12 +7,10 @@ bos_gui.py  –  BOS‑setup helper with checkerboard & image tools
 • Checkerboard PNG export: 2 px black / 1 px white gaps on A4 at 600 DPI
 • Tools:
     – Remove blank images
-    – Import images for subtraction → video + distance‐measurement tool
+    – Import images for subtraction → video + interactive frame/gain selector + distance measurement + snapshot
 """
 
-import os
-import math
-import glob
+import os, math, glob
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, simpledialog
 
@@ -51,7 +49,6 @@ def solve_ZA(S, f, ZD):
 
 # ─── Checkerboard generator ─────────────────────────────────────────
 def generate_checkerboard_image(square_size, spacing, output_file):
-    """Create A4 checkerboard PNG at 600 DPI with given px square/gap."""
     dpi = 600
     mm2in = 1 / 25.4
     w_px = int(210 * dpi * mm2in)
@@ -77,12 +74,10 @@ class BOSGui(tk.Tk):
         self.title("BOS Setup Calculator")
         # Menu bar
         menubar = tk.Menu(self)
-        # Tools menu
         toolsmenu = tk.Menu(menubar, tearoff=0)
         toolsmenu.add_command(label="Remove blank images", command=self.remove_images)
         toolsmenu.add_command(label="Import images for subtraction", command=self.import_subtraction)
         menubar.add_cascade(label="Tools", menu=toolsmenu)
-        # Help menu
         helpmenu = tk.Menu(menubar, tearoff=0)
         helpmenu.add_command(label="Parameters Explanation", command=self.show_help)
         menubar.add_cascade(label="Help", menu=helpmenu)
@@ -92,10 +87,9 @@ class BOSGui(tk.Tk):
         self._build_gui()
 
     def _make_vars(self):
-        keys = ("fov","sensor","npx","obj","fnum","focal","ZA","ZD","ZB",
-                "square_size","spacing")
+        keys = ("fov","sensor","npx","obj","fnum","focal","ZA","ZD","ZB","square_size","spacing")
         self.v = {k: tk.StringVar() for k in keys}
-        # Defaults
+        # defaults
         self.v["fov"].set("20")
         self.v["sensor"].set("13.6")
         self.v["npx"].set("1024")
@@ -108,8 +102,7 @@ class BOSGui(tk.Tk):
         self.goal = tk.StringVar(value="resolution")
 
     def _build_gui(self):
-        frm = ttk.Frame(self, padding=self.PAD)
-        frm.grid()
+        frm = ttk.Frame(self, padding=self.PAD); frm.grid()
         rows = [
             ("FOV [mm]"                , "fov"),
             ("Sensor size [mm]"        , "sensor"),
@@ -148,8 +141,7 @@ class BOSGui(tk.Tk):
         self.txt = tk.Text(frm, width=64, height=12, bg="#f5f5f5", relief="sunken")
         self.txt.grid(row=0, column=3, rowspan=rb+3, padx=(self.PAD,0))
 
-        self.canvas = tk.Canvas(frm, width=560, height=155, bg="white",
-                                relief="solid", bd=1)
+        self.canvas = tk.Canvas(frm, width=560, height=155, bg="white", relief="solid", bd=1)
         self.canvas.grid(row=rb+3, column=0, columnspan=5, pady=(self.PAD,0))
 
     def _num(self, key):
@@ -228,7 +220,7 @@ class BOSGui(tk.Tk):
         if pxmm:
             add(tk.END, f"Sampling:{pxmm:.2f} px/mm  obj={objpx:.1f} px\n")
             add(tk.END, f"Square={square_mm:.3f} mm (2 px)  Gap={gap_mm:.3f} mm (1 px)\n\n")
-        add(tk.END, "Advice: tweak ZD, focal or f# to optimize blur.\n")
+        add(tk.END, "Advice: tweak ZD, focal or f# to optimize blur.")
 
         self._draw_schematic(ZA, ZD, CoC)
 
@@ -301,122 +293,122 @@ class BOSGui(tk.Tk):
             filetypes=[("Images","*.png *.jpg *.jpeg *.bmp *.tif *.tiff")])
         if not files:
             return
-        gain = simpledialog.askfloat(
-            "Gain level", "Enter gain multiplier:", minvalue=0.0, initialvalue=1.0)
-        if gain is None:
-            return
+        # generate raw-diff video with default gain=1.0
+        self.subtract_files = files
+        self.first_gray = cv2.imread(files[0], cv2.IMREAD_GRAYSCALE)
         out_fn = filedialog.asksaveasfilename(
             defaultextension=".avi",
             filetypes=[("AVI","*.avi"),("MP4","*.mp4")])
         if not out_fn:
             return
-        first = cv2.imread(files[0], cv2.IMREAD_GRAYSCALE)
-        h, w = first.shape
         fourcc = cv2.VideoWriter_fourcc(*'XVID')
+        h, w = self.first_gray.shape
         vw = cv2.VideoWriter(out_fn, fourcc, 1.0, (w, h), False)
         for f in files[1:]:
             img = cv2.imread(f, cv2.IMREAD_GRAYSCALE)
-            diff = cv2.subtract(img, first)
-            diff = cv2.convertScaleAbs(diff, alpha=gain)
+            diff = cv2.subtract(img, self.first_gray)
+            diff = cv2.convertScaleAbs(diff, alpha=1.0)
             vw.write(diff)
         vw.release()
-        messagebox.showinfo("Done", f"Video saved to:\n{out_fn}")
+        messagebox.showinfo("Done", f"Video saved:\n{out_fn}")
         if messagebox.askyesno("Measure", "Measure distances now?"):
-            self.measure_distance(out_fn)
+            self.measure_distance()
 
-    def measure_distance(self, video_path):
-        # let user pick frame with trackbar
-        cap = cv2.VideoCapture(video_path)
-        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        if frame_count <= 0:
-            cap.release()
-            return messagebox.showerror("Error", "Cannot open video")
+    def measure_distance(self):
+        files = getattr(self, 'subtract_files', None)
+        first = getattr(self, 'first_gray', None)
+        if not files or first is None:
+            return messagebox.showerror("Error", "No subtraction data")
 
-        selected_frame = [0]
-        window = "Select frame (s=select, Esc=cancel)"
-        cv2.namedWindow(window, cv2.WINDOW_NORMAL)
+        count = len(files)
+        win = "Select frame (s=select, Esc=cancel)"
+        cv2.namedWindow(win, cv2.WINDOW_AUTOSIZE)
 
-        def on_trackbar(pos):
-            cap.set(cv2.CAP_PROP_POS_FRAMES, pos)
-            ret, fr = cap.read()
-            if ret:
-                display = fr.copy()
-                cv2.imshow(window, display)
-                selected_frame[0] = pos
+        sel_idx = [0]
+        gain_val = [100]  # slider value
 
-        # create trackbar from 0 … frame_count-1
-        cv2.createTrackbar("Frame", window, 0, frame_count - 1, on_trackbar)
-        # show first
-        on_trackbar(0)
+        def update(idx):
+            gray = cv2.imread(files[idx], cv2.IMREAD_GRAYSCALE)
+            diff = cv2.subtract(gray, first)
+            scaled = cv2.convertScaleAbs(diff, alpha=gain_val[0]/100.0)
+            color = cv2.cvtColor(scaled, cv2.COLOR_GRAY2BGR)
+            cv2.imshow(win, color)
+            self.current_display = color.copy()
 
-        # wait for user to press s or Esc
+        def on_frame(pos):
+            sel_idx[0] = pos
+            update(pos)
+
+        def on_gain(pos):
+            gain_val[0] = pos
+            update(sel_idx[0])
+
+        cv2.createTrackbar("Frame", win, 0, count-1, on_frame)
+        cv2.createTrackbar("Gain x100", win, 100, 2000, on_gain)  # increased max
+
+        update(0)
         while True:
             key = cv2.waitKey(50) & 0xFF
-            if key == ord('s'):  # select
-                idx = selected_frame[0]
+            if key == ord('s'):
+                idx = sel_idx[0]
                 break
-            elif key == 27:  # Esc
+            if key == 27:
                 idx = None
                 break
 
-        cv2.destroyWindow(window)
-        cap.release()
+        cv2.destroyWindow(win)
         if idx is None:
-            return  # cancelled
+            return
 
-        # now load that frame for calibration/measurement
-        cap = cv2.VideoCapture(video_path)
-        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-        ret, frame = cap.read()
-        cap.release()
-        if not ret:
-            return messagebox.showerror("Error", "Cannot read selected frame")
-
-        # convert to BGR if needed
-        if frame.ndim == 2:
-            img = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
-        else:
-            img = frame.copy()
-
+        img = self.current_display.copy()
         pts = []
-        cv2.namedWindow("Measure", cv2.WINDOW_NORMAL)
+        cv2.namedWindow("Measure", cv2.WINDOW_AUTOSIZE)
         cv2.imshow("Measure", img)
 
         def on_mouse(e, x, y, flags, param):
             if e == cv2.EVENT_LBUTTONDOWN and len(pts) < 4:
                 pts.append((x, y))
-                cv2.circle(img, (x, y), 5, (0, 0, 255), -1)
+                cv2.circle(img, (x, y), 5, (0,0,255), -1)
                 cv2.imshow("Measure", img)
 
         cv2.setMouseCallback("Measure", on_mouse)
 
-        # calibration
         messagebox.showinfo("Calibrate", "Click 2 points for calibration")
         while len(pts) < 2:
             cv2.waitKey(50)
         (x1, y1), (x2, y2) = pts[:2]
-        pixel_dist = math.hypot(x2 - x1, y2 - y1)
-        real_dist = simpledialog.askfloat("Calibrate",
-                                          "Enter real distance between those points (mm):", minvalue=0.0)
-        if real_dist is None:
+        pxd = math.hypot(x2-x1, y2-y1)
+        real = simpledialog.askfloat("Calibrate", "Enter real distance (mm):", minvalue=0.0)
+        if real is None:
             cv2.destroyWindow("Measure")
             return
-        px_per_mm = pixel_dist / real_dist
+        px_per_mm = pxd / real
         messagebox.showinfo("Calibrated", f"{px_per_mm:.3f} px/mm")
 
-        # measurement
-        messagebox.showinfo("Measure", "Now click 2 points to measure")
+        messagebox.showinfo("Measure", "Click 2 points to measure")
         while len(pts) < 4:
             cv2.waitKey(50)
         (x3, y3), (x4, y4) = pts[2:4]
-        meas_px = math.hypot(x4 - x3, y4 - y3)
-        meas_mm = meas_px / px_per_mm
-        messagebox.showinfo("Result", f"Distance: {meas_mm:.2f} mm")
+        dist_px = math.hypot(x4-x3, y4-y3)
+        dist_mm = dist_px / px_per_mm
+        messagebox.showinfo("Result", f"Distance: {dist_mm:.2f} mm")
+
+        # save snapshot with line and result text
+        overlay = img.copy()
+        cv2.line(overlay, (x3,y3), (x4,y4), (0,255,0), 2)
+        cv2.putText(overlay, f"{dist_mm:.2f} mm",
+                    (min(x3,x4), min(y3,y4)-10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,0), 2)
+        save_fn = filedialog.asksaveasfilename(defaultextension=".png",
+                    filetypes=[("PNG","*.png")])
+        if save_fn:
+            cv2.imwrite(save_fn, overlay)
+            messagebox.showinfo("Saved", f"Snapshot saved to:\n{save_fn}")
         cv2.destroyWindow("Measure")
 
     def _draw_schematic(self, ZA, ZD, CoC):
         c = self.canvas; c.delete("all")
-        W, H = 560, 155; top, base = 40, H - 30; total = ZA + ZD
+        W, H = 560, 155; top, base = 40, H-30; total = ZA + ZD
         X = lambda d: 60 + d/total*(W-120)
         cam, obj, bkg = X(0), X(ZA), X(total)
         for x, col in ((cam, "black"), (obj, "blue"), (bkg, "green")):
@@ -424,7 +416,7 @@ class BOSGui(tk.Tk):
         arrow = dict(arrow=tk.LAST, width=2)
         c.create_line(cam, base, obj, base, fill="blue", **arrow)
         c.create_line(obj, base-20, bkg, base-20, fill="green", **arrow)
-        pxmm = (W-120)/total; r_px = max(4, min(CoC*pxmm/2, 45))
+        pxmm = (W-120)/total; r_px = max(4, min(CoC*pxmm/2,45))
         c.create_oval(obj-r_px, top-r_px, obj+r_px, top+r_px, outline="red", width=2)
         c.create_text((cam+obj)/2, base+12, text=f"ZA {ZA:.0f} mm", fill="blue")
         c.create_text((obj+bkg)/2, base-8, text=f"ZD {ZD:.0f} mm", fill="green")
@@ -444,7 +436,8 @@ class BOSGui(tk.Tk):
             "Square   – checkerboard square size in px\n"
             "Spacing  – checkerboard gap size in px\n\n"
             "Tools → Remove blank images\n"
-            "      → Import images for subtraction + measure"
+            "      → Import images for subtraction + interactive frame/gain selector\n"
+            "           + distance measurement + snapshot"
         )
 
 if __name__ == "__main__":
