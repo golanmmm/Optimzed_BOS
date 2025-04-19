@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """
-bos_gui.py  –  BOS‑setup helper with checkerboard & image cleanup tools
+bos_gui.py  –  BOS‑setup helper with checkerboard & image tools
 ------------------------------------------------------------------------
 • Tkinter GUI (Python ≥3.8)
 • BOS geometry calculator + PDF export
-• Checkerboard PNG export: 2 px black / 1 px white gaps at 600 DPI A4
-• “Remove blank images” tool: delete every Nth image in a folder
+• Checkerboard PNG export: 2 px black / 1 px white gaps on A4 at 600 DPI
+• Tools menu:
+    – Remove blank images tool: delete every Nth image in a folder
+    – Import images for subtraction: subtract each from the first, apply gain, save as video
 """
 
 import os
@@ -73,8 +75,14 @@ class BOSGui(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("BOS Setup Calculator")
-        # Menu bar with Help
+        # Menu bar
         menubar = tk.Menu(self)
+        # Tools menu
+        toolsmenu = tk.Menu(menubar, tearoff=0)
+        toolsmenu.add_command(label="Remove blank images tool", command=self.remove_images)
+        toolsmenu.add_command(label="Import images for subtraction", command=self.import_subtraction)
+        menubar.add_cascade(label="Tools", menu=toolsmenu)
+        # Help menu
         helpmenu = tk.Menu(menubar, tearoff=0)
         helpmenu.add_command(label="Parameters Explanation", command=self.show_help)
         menubar.add_cascade(label="Help", menu=helpmenu)
@@ -87,16 +95,16 @@ class BOSGui(tk.Tk):
         keys = ("fov","sensor","npx","obj","fnum","focal","ZA","ZD","ZB",
                 "square_size","spacing")
         self.v = {k: tk.StringVar() for k in keys}
-        # updated defaults
-        self.v["fov"].set("20")           # 20 mm
-        self.v["sensor"].set("13.6")      # 13.6 mm
-        self.v["npx"].set("1024")         # 1024 px
-        self.v["obj"].set("0.75")         # 0.75 mm
-        self.v["fnum"].set("32")          # f/32
-        self.v["focal"].set("110")        # 110 mm
-        self.v["ZB"].set("290")           # 290 mm total
-        self.v["square_size"].set("2")    # 2 px
-        self.v["spacing"].set("1")        # 1 px
+        # defaults
+        self.v["fov"].set("20")
+        self.v["sensor"].set("13.6")
+        self.v["npx"].set("1024")
+        self.v["obj"].set("0.75")
+        self.v["fnum"].set("32")
+        self.v["focal"].set("110")
+        self.v["ZB"].set("290")
+        self.v["square_size"].set("2")
+        self.v["spacing"].set("1")
         self.goal = tk.StringVar(value="resolution")
 
     def _build_gui(self):
@@ -131,19 +139,17 @@ class BOSGui(tk.Tk):
             row=rb+1, column=2, columnspan=2, pady=(3,self.PAD))
         ttk.Button(frm, text="Export Checkerboard", command=self.export_checkerboard).grid(
             row=rb+2, column=0, columnspan=4, pady=(self.PAD,0))
-        ttk.Button(frm, text="Remove blank images tool", command=self.remove_images).grid(
-            row=rb+3, column=0, columnspan=4, pady=(self.PAD,0))
 
         self.txt = tk.Text(frm, width=64, height=12, bg="#f5f5f5", relief="sunken")
-        self.txt.grid(row=0, column=3, rowspan=rb+4, padx=(self.PAD,0))
+        self.txt.grid(row=0, column=3, rowspan=rb+3, padx=(self.PAD,0))
 
         self.canvas = tk.Canvas(frm, width=560, height=155, bg="white",
                                 relief="solid", bd=1)
-        self.canvas.grid(row=rb+4, column=0, columnspan=5, pady=(self.PAD,0))
+        self.canvas.grid(row=rb+3, column=0, columnspan=5, pady=(self.PAD,0))
 
     def _num(self, key):
         txt = self.v[key].get().strip()
-        return None if txt=="" else float(txt)
+        return None if txt == "" else float(txt)
 
     def _solve_geometry(self, S, f, ZA, ZD, ZB):
         if ZB and (ZA or ZD):
@@ -153,12 +159,12 @@ class BOSGui(tk.Tk):
                 raise ValueError("ZA+ZD ≠ ZB.")
             return ZA, ZD
         if ZA is not None:
-            z = solve_ZD(S,f,ZA)
+            z = solve_ZD(S, f, ZA)
             if ZB and ZA+z>ZB+1e-6:
                 raise ValueError("ZA+ZD > ZB.")
             return ZA, z
         if ZD is not None:
-            a = solve_ZA(S,f,ZD)
+            a = solve_ZA(S, f, ZD)
             if ZB and a+ZD>ZB+1e-6:
                 raise ValueError("ZA+ZD > ZB.")
             return a, ZD
@@ -166,80 +172,98 @@ class BOSGui(tk.Tk):
         ZA_v = max(f*1.2, ZBv/2)
         ZD_v = ZBv - ZA_v
         S0 = sensitivity(f, ZA_v, ZD_v)
-        scale = S/S0
-        ZD_v *= scale
+        ZD_v *= (S / S0)
         ZA_v = ZBv - ZD_v
-        if ZA_v<=f:
+        if ZA_v <= f:
             raise ValueError("Cannot fit ZA > f within ZB.")
         return ZA_v, ZD_v
 
     def calculate(self):
         try:
-            fov=float(self.v["fov"].get()); sensor=float(self.v["sensor"].get())
-            obj=float(self.v["obj"].get()); fnum=float(self.v["fnum"].get())
-            focal=float(self.v["focal"].get())
+            fov    = float(self.v["fov"].get())
+            sensor = float(self.v["sensor"].get())
+            obj    = float(self.v["obj"].get())
+            fnum   = float(self.v["fnum"].get())
+            focal  = float(self.v["focal"].get())
         except ValueError:
-            messagebox.showerror("Input error","Enter valid numbers"); return
+            messagebox.showerror("Input error","Enter valid numbers")
+            return
 
-        npx=self._num("npx"); ZA_in=self._num("ZA"); ZD_in=self._num("ZD"); ZB_in=self._num("ZB")
-        goal=self.goal.get()
-        factor=3.0 if goal=="signal" else 1.0
-        CoC_t=factor*obj; S_req=CoC_t*fnum*(1+sensor/fov)
+        npx   = self._num("npx")
+        ZA_in = self._num("ZA"); ZD_in = self._num("ZD"); ZB_in = self._num("ZB")
+        goal  = self.goal.get()
+
+        factor = 3.0 if goal=="signal" else 1.0
+        CoC_t  = factor * obj
+        S_req  = CoC_t * fnum * (1 + sensor / fov)
 
         try:
-            ZA,ZD=self._solve_geometry(S_req,focal,ZA_in,ZD_in,ZB_in)
-            S=sensitivity(focal,ZA,ZD)
+            ZA, ZD = self._solve_geometry(S_req, focal, ZA_in, ZD_in, ZB_in)
+            S       = sensitivity(focal, ZA, ZD)
         except ValueError as e:
-            messagebox.showerror("Geometry error",str(e)); return
+            messagebox.showerror("Geometry error", str(e))
+            return
 
-        CoC=coc_object(S,fnum,sensor,fov); s_min=CoC/2; B=blur_loss(CoC,obj); S_eff=S*B; ratio=CoC/obj
-        pxmm=npx/fov if npx else None; objpx=obj*pxmm if pxmm else None
-        square_mm=2.0/pxmm if pxmm else None; gap_mm=1.0/pxmm if pxmm else None
+        CoC    = coc_object(S, fnum, sensor, fov)
+        s_min  = CoC/2; B = blur_loss(CoC, obj); S_eff = S*B; ratio = CoC/obj
 
-        self.txt.delete(1.0,tk.END); add=self.txt.insert
-        add(tk.END,f"ZA={ZA:.2f} mm  ZD={ZD:.2f} mm  ZB={ZA+ZD:.2f} mm\n\n")
-        add(tk.END,f"S={S:.3f} mm/px deflection\n")
-        add(tk.END,f"CoC={CoC:.3f} mm ({ratio:.2f}×obj)\n")
-        add(tk.END,f"s_min≈CoC/2={s_min:.3f} mm\n")
-        add(tk.END,f"B={B:.3f}  S_eff={S_eff:.3f} mm\n\n")
+        pxmm      = npx/fov if npx else None
+        objpx     = obj*pxmm if pxmm else None
+        square_mm = 2.0/pxmm if pxmm else None
+        gap_mm    = 1.0/pxmm if pxmm else None
+
+        self.txt.delete(1.0, tk.END)
+        add = self.txt.insert
+        add(tk.END, f"ZA={ZA:.2f} mm  ZD={ZD:.2f} mm  ZB={ZA+ZD:.2f} mm\n\n")
+        add(tk.END, f"S={S:.3f} mm/px deflection\n")
+        add(tk.END, f"CoC={CoC:.3f} mm ({ratio:.2f}×obj)\n")
+        add(tk.END, f"s_min≈CoC/2={s_min:.3f} mm\n")
+        add(tk.END, f"B={B:.3f}  S_eff={S_eff:.3f} mm\n\n")
         if pxmm:
-            add(tk.END,f"Sampling:{pxmm:.2f} px/mm  obj={objpx:.1f} px\n")
-            add(tk.END,f"Square={square_mm:.3f} mm (2 px)  Gap={gap_mm:.3f} mm (1 px)\n\n")
-        add(tk.END,"Advice: tweak ZD, focal or f# to optimize blur.\n")
-        self._draw_schematic(ZA,ZD,CoC)
+            add(tk.END, f"Sampling:{pxmm:.2f} px/mm  obj={objpx:.1f} px\n")
+            add(tk.END, f"Square={square_mm:.3f} mm (2 px)  Gap={gap_mm:.3f} mm (1 px)\n\n")
+        add(tk.END, "Advice: tweak ZD, focal or f# to optimize blur.\n")
+        self._draw_schematic(ZA, ZD, CoC)
 
     def export_pdf(self):
-        npx=self._num("npx"); fov=float(self.v["fov"].get())
+        npx = self._num("npx"); fov = float(self.v["fov"].get())
         if not npx or fov<=0:
-            messagebox.showerror("Export error","Enter sensor pixels & FOV"); return
+            messagebox.showerror("Export error","Enter sensor pixels & FOV")
+            return
 
-        ss=int(self.v["square_size"].get()); sp=int(self.v["spacing"].get())
-        dpi=600; mm2in=1/25.4
-        Wpx=int(210*dpi*mm2in); Hpx=int(297*dpi*mm2in)
-        tile=np.full((ss+sp,ss+sp),255,dtype=np.uint8)
-        tile[:ss,:ss]=0
-        reps_y=Hpx//tile.shape[0]+1; reps_x=Wpx//tile.shape[1]+1
-        pattern=np.tile(tile,(reps_y,reps_x))[:Hpx,:Wpx]
+        ss = int(self.v["square_size"].get())
+        sp = int(self.v["spacing"].get())
 
-        fn=filedialog.asksaveasfilename(defaultextension=".pdf",
-            filetypes=[("PDF","*.pdf")])
+        dpi = 600; mm2in = 1/25.4
+        Wpx = int(210 * dpi * mm2in)
+        Hpx = int(297 * dpi * mm2in)
+
+        tile = np.full((ss+sp, ss+sp), 255, dtype=np.uint8)
+        tile[:ss, :ss] = 0
+        reps_y = Hpx // tile.shape[0] + 1
+        reps_x = Wpx // tile.shape[1] + 1
+        pattern = np.tile(tile, (reps_y, reps_x))[:Hpx, :Wpx]
+
+        fn = filedialog.asksaveasfilename(defaultextension=".pdf",
+                                          filetypes=[("PDF","*.pdf")])
         if not fn: return
 
-        fig=plt.figure(figsize=(210*mm2in,297*mm2in),dpi=dpi)
-        ax=fig.add_axes([0,0,1,1])
-        ax.imshow(pattern,cmap="gray",vmin=0,vmax=255,interpolation="nearest")
+        fig = plt.figure(figsize=(210*mm2in, 297*mm2in), dpi=dpi)
+        ax  = fig.add_axes([0,0,1,1])
+        ax.imshow(pattern, cmap="gray", vmin=0, vmax=255, interpolation="nearest")
         ax.axis("off")
-        fig.savefig(fn,dpi=dpi,format="pdf",pad_inches=0)
+        fig.savefig(fn, dpi=dpi, format="pdf", pad_inches=0)
         plt.close(fig)
-        messagebox.showinfo("Exported",f"Checkerboard PDF saved to:\n{fn}")
+        messagebox.showinfo("Exported", f"Checkerboard PDF saved to:\n{fn}")
 
     def export_checkerboard(self):
-        ss=int(self.v["square_size"].get()); sp=int(self.v["spacing"].get())
-        fn=filedialog.asksaveasfilename(defaultextension=".png",
-            filetypes=[("PNG","*.png")])
+        ss = int(self.v["square_size"].get())
+        sp = int(self.v["spacing"].get())
+        fn = filedialog.asksaveasfilename(defaultextension=".png",
+                                          filetypes=[("PNG","*.png")])
         if not fn: return
         generate_checkerboard_image(ss, sp, fn)
-        messagebox.showinfo("Done",f"Checkerboard PNG saved to:\n{fn}")
+        messagebox.showinfo("Done", f"Checkerboard PNG saved to:\n{fn}")
 
     def remove_images(self):
         folder = filedialog.askdirectory(title="Select folder")
@@ -251,15 +275,34 @@ class BOSGui(tk.Tk):
         for e in exts:
             files.extend(glob.glob(os.path.join(folder, e)))
         files.sort()
-        total = len(files); deleted=0
+        deleted = 0
         for idx, fpath in enumerate(files, start=1):
             if idx % n == 0:
-                try:
-                    os.remove(fpath)
-                    deleted += 1
-                except:
-                    pass
-        messagebox.showinfo("Done", f"Deleted {deleted} of {total} images in\n{folder}")
+                try: os.remove(fpath); deleted += 1
+                except: pass
+        messagebox.showinfo("Done", f"Deleted {deleted} of {len(files)} images")
+
+    def import_subtraction(self):
+        files = filedialog.askopenfilenames(title="Select images",
+            filetypes=[("Images","*.png *.jpg *.jpeg *.bmp *.tif *.tiff")])
+        if not files: return
+        gain = simpledialog.askfloat("Gain level", "Enter gain multiplier:", minvalue=0.0, initialvalue=1.0)
+        if gain is None: return
+        out_fn = filedialog.asksaveasfilename(defaultextension=".avi",
+            filetypes=[("AVI","*.avi"),("MP4","*.mp4")])
+        if not out_fn: return
+        # prepare video
+        first = cv2.imread(files[0], cv2.IMREAD_GRAYSCALE)
+        h, w = first.shape
+        fourcc = cv2.VideoWriter_fourcc(*'XVID')
+        vw = cv2.VideoWriter(out_fn, fourcc, 1.0, (w, h), False)
+        for f in files[1:]:
+            img = cv2.imread(f, cv2.IMREAD_GRAYSCALE)
+            diff = cv2.subtract(img, first)
+            diff = cv2.convertScaleAbs(diff, alpha=gain)
+            vw.write(diff)
+        vw.release()
+        messagebox.showinfo("Done", f"Subtraction video saved to:\n{out_fn}")
 
     def _draw_schematic(self, ZA, ZD, CoC):
         c=self.canvas; c.delete("all")
@@ -290,9 +333,9 @@ class BOSGui(tk.Tk):
             "ZB       – total camera→background span (mm)\n"
             "Square   – checkerboard square size in px\n"
             "Spacing  – checkerboard gap size in px\n\n"
-            "Use 'Export Checkerboard' to save a PNG.\n"
-            "Use 'Remove blank images tool' to delete every Nth image in a folder."
+            "Tools | Remove blank images tool | Import images for subtraction\n"
+            "Use 'Export Checkerboard' to save PNG checker pattern."
         )
 
-if __name__=="__main__":
+if __name__ == "__main__":
     BOSGui().mainloop()
