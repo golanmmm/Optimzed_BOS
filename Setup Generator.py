@@ -325,47 +325,93 @@ class BOSGui(tk.Tk):
             self.measure_distance(out_fn)
 
     def measure_distance(self, video_path):
+        # let user pick frame with trackbar
         cap = cv2.VideoCapture(video_path)
-        cnt = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        idx = simpledialog.askinteger(
-            "Frame", f"Enter frame index (0–{cnt-1}):",
-            minvalue=0, maxvalue=max(cnt-1,0))
+        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if frame_count <= 0:
+            cap.release()
+            return messagebox.showerror("Error", "Cannot open video")
+
+        selected_frame = [0]
+        window = "Select frame (s=select, Esc=cancel)"
+        cv2.namedWindow(window, cv2.WINDOW_NORMAL)
+
+        def on_trackbar(pos):
+            cap.set(cv2.CAP_PROP_POS_FRAMES, pos)
+            ret, fr = cap.read()
+            if ret:
+                display = fr.copy()
+                cv2.imshow(window, display)
+                selected_frame[0] = pos
+
+        # create trackbar from 0 … frame_count-1
+        cv2.createTrackbar("Frame", window, 0, frame_count - 1, on_trackbar)
+        # show first
+        on_trackbar(0)
+
+        # wait for user to press s or Esc
+        while True:
+            key = cv2.waitKey(50) & 0xFF
+            if key == ord('s'):  # select
+                idx = selected_frame[0]
+                break
+            elif key == 27:  # Esc
+                idx = None
+                break
+
+        cv2.destroyWindow(window)
+        cap.release()
         if idx is None:
-            cap.release(); return
+            return  # cancelled
+
+        # now load that frame for calibration/measurement
+        cap = cv2.VideoCapture(video_path)
         cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
         ret, frame = cap.read()
         cap.release()
         if not ret:
-            return messagebox.showerror("Error", "Cannot read frame")
+            return messagebox.showerror("Error", "Cannot read selected frame")
+
+        # convert to BGR if needed
         if frame.ndim == 2:
             img = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
         else:
             img = frame.copy()
+
         pts = []
         cv2.namedWindow("Measure", cv2.WINDOW_NORMAL)
-        def on_mouse(event, x, y, flags, param):
-            if event == cv2.EVENT_LBUTTONDOWN and len(pts) < 4:
+        cv2.imshow("Measure", img)
+
+        def on_mouse(e, x, y, flags, param):
+            if e == cv2.EVENT_LBUTTONDOWN and len(pts) < 4:
                 pts.append((x, y))
                 cv2.circle(img, (x, y), 5, (0, 0, 255), -1)
                 cv2.imshow("Measure", img)
+
         cv2.setMouseCallback("Measure", on_mouse)
-        cv2.imshow("Measure", img)
-        messagebox.showinfo("Calibrate", "Click two points for calibration")
+
+        # calibration
+        messagebox.showinfo("Calibrate", "Click 2 points for calibration")
         while len(pts) < 2:
             cv2.waitKey(50)
         (x1, y1), (x2, y2) = pts[:2]
-        pxd = math.hypot(x2 - x1, y2 - y1)
-        real = simpledialog.askfloat("Calibrate", "Enter real distance (mm):", minvalue=0.0)
-        if real is None:
-            cv2.destroyWindow("Measure"); return
-        px_per_mm = pxd / real
+        pixel_dist = math.hypot(x2 - x1, y2 - y1)
+        real_dist = simpledialog.askfloat("Calibrate",
+                                          "Enter real distance between those points (mm):", minvalue=0.0)
+        if real_dist is None:
+            cv2.destroyWindow("Measure")
+            return
+        px_per_mm = pixel_dist / real_dist
         messagebox.showinfo("Calibrated", f"{px_per_mm:.3f} px/mm")
-        messagebox.showinfo("Measure", "Now click two points to measure")
+
+        # measurement
+        messagebox.showinfo("Measure", "Now click 2 points to measure")
         while len(pts) < 4:
             cv2.waitKey(50)
         (x3, y3), (x4, y4) = pts[2:4]
-        dist_mm = math.hypot(x4 - x3, y4 - y3) / px_per_mm
-        messagebox.showinfo("Result", f"Distance: {dist_mm:.2f} mm")
+        meas_px = math.hypot(x4 - x3, y4 - y3)
+        meas_mm = meas_px / px_per_mm
+        messagebox.showinfo("Result", f"Distance: {meas_mm:.2f} mm")
         cv2.destroyWindow("Measure")
 
     def _draw_schematic(self, ZA, ZD, CoC):
