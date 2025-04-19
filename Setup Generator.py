@@ -1,99 +1,113 @@
 #!/usr/bin/env python3
 """
-bos_gui.py  –  BOS‑setup helper with checkerboard & image tools
-------------------------------------------------------------------------
-• Tkinter GUI (Python ≥3.8)
-• BOS geometry calculator + PDF export
-• Checkerboard PNG export
-• Tools:
-    – Remove blank images
-    – Import images for subtraction → interactive scrub/gain/filters +
-      measurement + final filtered‑video export + snapshot
+BOS‑helper GUI
+────────────────────────────────────────────────────────────────────────
+• BOS geometry calculator  (schematic drawn to canvas)
+• Checkerboard PNG export (A4 @ 600 dpi, 2 px squares default)
+• Remove‑blank‑images utility  (delete every n‑th)
+• Image‑subtraction tool  (scrub filters, calibration & measurements,
+  export filtered video & annotated snapshot)
+
+Requires:  Python ≥3.8,  Tkinter, OpenCV‑Python, NumPy
 """
 
-import os
-import math
-import glob
+import math, os, glob, shutil, itertools
 import tkinter as tk
-from tkinter import ttk, messagebox, filedialog, simpledialog
+from tkinter import ttk, filedialog, messagebox, simpledialog
 
 import numpy as np
 import cv2
-import matplotlib.pyplot as plt
+from PIL import Image, ImageTk
 
-# ─── BOS formulas ───────────────────────────────────────────────────
-def sensitivity(f, ZA, ZD):
-    if ZA <= f or ZD <= 0:
-        raise ValueError("Require ZA > focal and ZD > 0.")
-    denom = ZD + ZA - f
+
+# ───────────────────────── BOS formulas ──────────────────────────────
+def sensitivity(f, za, zd):
+    if za <= f or zd <= 0:
+        raise ValueError("Need ZA>f and ZD>0")
+    denom = zd + za - f
     if abs(denom) < 1e-12:
-        raise ValueError("Geometry denominator ≈ 0.")
-    return f * ZD / denom
+        raise ValueError("Geometry denominator≈0")
+    return f * zd / denom
+
 
 def coc_object(S, fnum, sensor, fov):
+    """circle‑of‑confusion in object plane (mm)."""
     return S / (fnum * (1 + sensor / fov))
 
-blur_loss = lambda CoC, obj, k=1/3: math.exp(-k * CoC / obj)
+
+def blur_loss(CoC, obj, k=1 / 3):
+    """empirical loss factor"""
+    return math.exp(-k * CoC / obj)
+
 
 def solve_ZD(S, f, ZA):
     den = S - f
     if abs(den) < 1e-12:
-        raise ValueError("Cannot solve ZD (S≈f).")
-    ZD = S * (f - ZA) / den
-    if ZD <= 0:
-        raise ValueError("Solved ZD ≤ 0.")
-    return ZD
+        raise ValueError("Cannot solve ZD (S≈f)")
+    zd = S * (f - ZA) / den
+    if zd <= 0:
+        raise ValueError("Solved ZD ≤ 0")
+    return zd
+
 
 def solve_ZA(S, f, ZD):
-    ZA = (f * ZD + S * (f - ZD)) / S
-    if ZA <= f:
-        raise ValueError("Solved ZA ≤ f.")
-    return ZA
+    za = (f * ZD + S * (f - ZD)) / S
+    if za <= f:
+        raise ValueError("Solved ZA ≤ f")
+    return za
 
-# ─── Checkerboard generator ─────────────────────────────────────────
-def generate_checkerboard_image(square_size, spacing, output_file):
+
+# ───────────── Checkerboard generator (600 dpi, A4) ──────────────────
+def generate_checkerboard(square_px, gap_px, fn):
     dpi = 600
     mm2in = 1 / 25.4
-    w_px = int(210 * dpi * mm2in)
-    h_px = int(297 * dpi * mm2in)
-    cols = w_px // (square_size + spacing)
-    rows = h_px // (square_size + spacing)
-    img = np.full((h_px, w_px, 3), 255, dtype=np.uint8)
-    for i in range(rows):
-        for j in range(cols):
-            top = i * (square_size + spacing)
-            left = j * (square_size + spacing)
-            color = (0, 0, 0) if (i + j) % 2 == 0 else (255, 255, 255)
-            br = (left + square_size, top + square_size)
-            cv2.rectangle(img, (left, top), br, color, -1)
-    cv2.imwrite(output_file, img, [cv2.IMWRITE_PNG_COMPRESSION, 0])
+    width = int(210 * dpi * mm2in)
+    height = int(297 * dpi * mm2in)
+    img = np.full((height, width, 3), 255, dtype=np.uint8)
+    pitch = square_px + gap_px
+    for i in range(0, height, pitch):
+        for j in range(0, width, pitch):
+            if ((i // pitch) + (j // pitch)) % 2 == 0:
+                img[i : i + square_px, j : j + square_px] = 0
+    cv2.imwrite(fn, img, [cv2.IMWRITE_PNG_COMPRESSION, 0])
 
-# ─── Main GUI ───────────────────────────────────────────────────────
+
+# ─────────────────────────── Main GUI ────────────────────────────────
 class BOSGui(tk.Tk):
     PAD = 5
 
+    # ───────────────── init ──────────────────
     def __init__(self):
         super().__init__()
-        self.title("BOS Setup Calculator")
+        self.title("BOS Setup Helper")
+        self._scrub_state = None
 
-        menubar = tk.Menu(self)
-        tools = tk.Menu(menubar, tearoff=0)
-        tools.add_command(label="Remove blank images", command=self.remove_images)
-        tools.add_command(label="Import images for subtraction", command=self.import_subtraction)
-        menubar.add_cascade(label="Tools", menu=tools)
-
-        helpm = tk.Menu(menubar, tearoff=0)
-        helpm.add_command(label="Parameters Explanation", command=self.show_help)
-        menubar.add_cascade(label="Help", menu=helpm)
-
-        self.config(menu=menubar)
         self._make_vars()
-        self._build_gui()
+        self._build_layout()
+        self._build_menu()
 
+    # ─────────────── helpers ──────────────────
+    def _varf(self, key):
+        txt = self.v[key].get().strip()
+        return None if not txt else float(txt)
+
+    # ───────── build widgets ──────────────────
     def _make_vars(self):
-        keys = ("fov","sensor","npx","obj","fnum","focal","ZA","ZD","ZB","square_size","spacing")
+        keys = (
+            "fov",
+            "sensor",
+            "npx",
+            "obj",
+            "fnum",
+            "focal",
+            "ZA",
+            "ZD",
+            "ZB",
+            "square",
+            "gap",
+        )
         self.v = {k: tk.StringVar() for k in keys}
-        # defaults
+        # sensible defaults
         self.v["fov"].set("20")
         self.v["sensor"].set("13.6")
         self.v["npx"].set("1024")
@@ -101,337 +115,408 @@ class BOSGui(tk.Tk):
         self.v["fnum"].set("32")
         self.v["focal"].set("110")
         self.v["ZB"].set("290")
-        self.v["square_size"].set("2")
-        self.v["spacing"].set("1")
+        self.v["square"].set("2")
+        self.v["gap"].set("1")
         self.goal = tk.StringVar(value="resolution")
 
-    def _build_gui(self):
+    def _build_layout(self):
         frm = ttk.Frame(self, padding=self.PAD)
         frm.grid()
+
+        # numeric inputs
         rows = [
-            ("FOV [mm]",      "fov"),
-            ("Sensor [mm]",   "sensor"),
-            ("Pixels",        "npx"),
-            ("Object [mm]",   "obj"),
-            ("f‑number",      "fnum"),
-            ("Focal [mm]",    "focal"),
-            ("ZA [mm]",       "ZA"),
-            ("ZD [mm]",       "ZD"),
-            ("ZB [mm]",       "ZB"),
-            ("Checker sq [px]","square_size"),
-            ("Checker gp [px]","spacing"),
+            ("FOV [mm]", "fov"),
+            ("Sensor [mm]", "sensor"),
+            ("Pixels", "npx"),
+            ("Object size [mm]", "obj"),
+            ("f‑number", "fnum"),
+            ("Focal length [mm]", "focal"),
+            ("ZA [mm]", "ZA"),
+            ("ZD [mm]", "ZD"),
+            ("ZB [mm]", "ZB"),
+            ("Checker square [px]", "square"),
+            ("Checker gap [px]", "gap"),
         ]
-        for i, (lbl, k) in enumerate(rows):
+        for i, (lbl, key) in enumerate(rows):
             ttk.Label(frm, text=lbl).grid(row=i, column=0, sticky="w")
-            ttk.Entry(frm, width=12, textvariable=self.v[k]).grid(row=i, column=1, padx=(0,self.PAD))
+            ttk.Entry(frm, width=10, textvariable=self.v[key]).grid(
+                row=i, column=1, padx=(0, self.PAD)
+            )
 
         rb = len(rows)
-        ttk.Label(frm, text="Goal").grid(row=rb, column=0, sticky="w")
-        for c, (txt, val) in enumerate((("Signal","signal"),("Resolution","resolution"))):
-            ttk.Radiobutton(frm, text=txt, variable=self.goal, value=val).grid(row=rb, column=1+c)
+        ttk.Label(frm, text="Optimise for").grid(row=rb, column=0, sticky="w")
+        ttk.Radiobutton(frm, text="Resolution", value="resolution", variable=self.goal).grid(
+            row=rb, column=1, sticky="w"
+        )
+        ttk.Radiobutton(frm, text="Signal", value="signal", variable=self.goal).grid(
+            row=rb, column=2, sticky="w"
+        )
 
-        ttk.Button(frm, text="Calculate", command=self.calculate).grid(row=rb+1, column=0, columnspan=2, pady=(3,self.PAD))
-        ttk.Button(frm, text="Export PDF", command=self.export_pdf).grid(row=rb+1, column=2, columnspan=2, pady=(3,self.PAD))
-        ttk.Button(frm, text="Export Checkerboard", command=self.export_checkerboard).grid(row=rb+2, column=0, columnspan=4)
+        ttk.Button(frm, text="Calculate", command=self.calculate).grid(
+            row=rb + 1, column=0, columnspan=3, pady=(4, self.PAD), sticky="ew"
+        )
+        ttk.Button(frm, text="Export checkerboard", command=self.export_checker).grid(
+            row=rb + 2, column=0, columnspan=3, sticky="ew"
+        )
 
-        self.txt = tk.Text(frm, width=64, height=12, bg="#f5f5f5", relief="sunken")
-        self.txt.grid(row=0, column=3, rowspan=rb+3, padx=(self.PAD,0))
+        # results text + schematic canvas
+        self.txt = tk.Text(frm, width=62, height=12, bg="#f6f6f6")
+        self.txt.grid(row=0, column=3, rowspan=rb + 3, padx=(self.PAD, 0))
+        self.canvas = tk.Canvas(frm, width=560, height=155, bg="white", bd=1, relief="sunken")
+        self.canvas.grid(row=rb + 3, column=0, columnspan=4, pady=self.PAD)
 
-        self.canvas = tk.Canvas(frm, width=560, height=155, bg="white", bd=1, relief="solid")
-        self.canvas.grid(row=rb+3, column=0, columnspan=5, pady=self.PAD)
+    def _build_menu(self):
+        mb = tk.Menu(self)
+        # tools
+        tools = tk.Menu(mb, tearoff=0)
+        tools.add_command(label="Remove blank images", command=self.remove_images)
+        tools.add_command(label="Import images for subtraction", command=self.import_subtraction)
+        mb.add_cascade(label="Tools", menu=tools)
+        # help
+        helpm = tk.Menu(mb, tearoff=0)
+        helpm.add_command(label="Parameter help", command=self.show_help)
+        mb.add_cascade(label="Help", menu=helpm)
+        self.config(menu=mb)
 
-    def _num(self, key):
-        t = self.v[key].get().strip()
-        return None if not t else float(t)
-
-    def _solve_geometry(self, S_req, f, ZA, ZD, ZB):
-        if ZB and (ZA or ZD):
-            raise ValueError("Use ZB or ZA/ZD, not both.")
-        if ZA is not None and ZD is not None:
-            if ZB and abs((ZA+ZD)-ZB) > 1e-6:
-                raise ValueError("ZA+ZD ≠ ZB.")
-            return ZA, ZD
-        if ZA is not None:
-            z = solve_ZD(S_req, f, ZA)
-            if ZB and ZA+z > ZB+1e-6:
-                raise ValueError("ZA+ZD > ZB.")
-            return ZA, z
-        if ZD is not None:
-            a = solve_ZA(S_req, f, ZD)
-            if ZB and a+ZD > ZB+1e-6:
-                raise ValueError("ZA+ZD > ZB.")
-            return a, ZD
-        ZBv = ZB or max(6*f,1000)
-        ZA_v = max(f*1.2, ZBv/2)
-        ZD_v = ZBv - ZA_v
-        S0 = sensitivity(f, ZA_v, ZD_v)
-        ZD_v *= (S_req/S0)
-        ZA_v = ZBv - ZD_v
-        if ZA_v <= f:
-            raise ValueError("Cannot fit ZA>f within ZB.")
-        return ZA_v, ZD_v
-
-    # ────────────────────────── Calculation ─────────────────────────────
+    # ────────────────── calculation & schematic ───────────────────────
     def calculate(self):
+        # grab & validate numbers
         try:
-            fov, sensor, obj, fnum, focal = (
-                float(self.v["fov"].get()),
-                float(self.v["sensor"].get()),
-                float(self.v["obj"].get()),
-                float(self.v["fnum"].get()),
-                float(self.v["focal"].get())
-            )
+            fov = float(self.v["fov"].get())
+            sensor = float(self.v["sensor"].get())
+            obj = float(self.v["obj"].get())
+            fnum = float(self.v["fnum"].get())
+            focal = float(self.v["focal"].get())
         except ValueError:
-            return messagebox.showerror("Input","Enter valid numbers")
+            return messagebox.showerror("Input", "Please enter valid numbers")
 
-        npx   = self._num("npx")
-        ZA_in = self._num("ZA"); ZD_in = self._num("ZD"); ZB_in = self._num("ZB")
-        goal  = self.goal.get()
-        factor = 3.0 if goal=="signal" else 1.0
-        CoC_t  = factor * obj
-        S_req  = CoC_t * fnum * (1 + sensor/fov)
+        npx = self._varf("npx")
+        ZA_in, ZD_in, ZB_in = self._varf("ZA"), self._varf("ZD"), self._varf("ZB")
+
+        factor = 3.0 if self.goal.get() == "signal" else 1.0
+        CoC_target = factor * obj
+        S_req = CoC_target * fnum * (1 + sensor / fov)
 
         try:
             ZA, ZD = self._solve_geometry(S_req, focal, ZA_in, ZD_in, ZB_in)
-            S       = sensitivity(focal, ZA, ZD)
+            S = sensitivity(focal, ZA, ZD)
         except Exception as e:
             return messagebox.showerror("Geometry", str(e))
 
-        CoC   = coc_object(S, fnum, sensor, fov)
-        s_min = CoC/2
-        B     = blur_loss(CoC, obj)
-        S_eff = S * B
+        CoC = coc_object(S, fnum, sensor, fov)
+        smin = CoC / 2
+        B = blur_loss(CoC, obj)
+        Seff = S * B
         ratio = CoC / obj
 
-        pxmm   = npx/fov if npx else None
-        objpx  = obj * pxmm if pxmm else None
-        sq_mm  = 2.0/pxmm if pxmm else None
-        gp_mm  = 1.0/pxmm if pxmm else None
+        # build results text
+        self.txt.delete("1.0", tk.END)
+        t = self.txt.insert
+        t(tk.END, f"ZA={ZA:.1f} mm   ZD={ZD:.1f} mm   ZB={ZA+ZD:.1f} mm\n\n")
+        t(tk.END, f"S={S:.3f} mm/px   CoC={CoC:.3f} mm ({ratio:.2f}×obj)\n")
+        t(tk.END, f"s_min≈{smin:.3f} mm   B={B:.3f}   S_eff={Seff:.3f}\n\n")
 
-        self.txt.delete(1.0, tk.END)
-        add = self.txt.insert
-        add(tk.END, f"ZA={ZA:.2f} mm  ZD={ZD:.2f} mm  ZB={ZA+ZD:.2f} mm\n\n")
-        add(tk.END, f"S={S:.3f} mm/px  CoC={CoC:.3f} mm ({ratio:.2f}×obj)\n")
-        add(tk.END, f"s_min≈{s_min:.3f} mm  B={B:.3f}  S_eff={S_eff:.3f}\n\n")
-        if pxmm:
-            add(tk.END, f"Sampling:{pxmm:.2f} px/mm  obj={objpx:.1f} px\n")
-            add(tk.END, f"Square={sq_mm:.3f} mm  Gap={gp_mm:.3f} mm\n\n")
-        add(tk.END, "Advice: tweak ZD, focal or f‑number to optimize blur.")
+        if npx:
+            pxmm = npx / fov
+            t(tk.END, f"Sampling ≈ {pxmm:.1f} px/mm\n")
+            t(tk.END, f"   →  object ≈ {obj*pxmm:.1f} px\n\n")
+        t(tk.END, "Blue, green arrows show ZA & ZD. Red circle=blur CoC.")
 
+        # schematic
         self._draw_schematic(ZA, ZD, CoC)
 
-    # ─────────────────────────── file ops ──────────────────────────────
-    def export_pdf(self):
-        npx = self._num("npx"); fov = float(self.v["fov"].get())
-        if not npx or fov <= 0:
-            return messagebox.showerror("Export","Enter pixels & FOV")
-        ss = int(self.v["square_size"].get()); sp = int(self.v["spacing"].get())
-        dpi = 600; mm2in = 1/25.4
-        Wpx = int(210*dpi*mm2in); Hpx = int(297*dpi*mm2in)
-        tile = np.full((ss+sp,ss+sp),255,dtype=np.uint8); tile[:ss,:ss]=0
-        pattern = np.tile(tile,(Hpx//tile.shape[0]+1, Wpx//tile.shape[1]+1))[:Hpx,:Wpx]
-        fn = filedialog.asksaveasfilename(defaultextension=".pdf",filetypes=[("PDF","*.pdf")])
-        if not fn: return
-        fig = plt.figure(figsize=(210*mm2in,297*mm2in),dpi=dpi)
-        ax = fig.add_axes([0,0,1,1])
-        ax.imshow(pattern, cmap="gray",vmin=0,vmax=255,interpolation="nearest")
-        ax.axis("off")
-        fig.savefig(fn, dpi=dpi, format="pdf", pad_inches=0)
-        plt.close(fig)
-        messagebox.showinfo("Exported", f"PDF saved:\n{fn}")
-
-    def export_checkerboard(self):
-        ss = int(self.v["square_size"].get()); sp = int(self.v["spacing"].get())
-        fn = filedialog.asksaveasfilename(defaultextension=".png",filetypes=[("PNG","*.png")])
-        if not fn: return
-        generate_checkerboard_image(ss, sp, fn)
-        messagebox.showinfo("Done", f"PNG saved:\n{fn}")
-
-    def remove_images(self):
-        folder = filedialog.askdirectory(title="Select folder")
-        if not folder:
+    def _draw_schematic(self, ZA, ZD, coc_mm):
+        W, H = 560, 155
+        top, base = 35, H - 30
+        total = ZA + ZD
+        c = self.canvas
+        c.delete("all")
+        if total <= 0:
             return
-        n = simpledialog.askinteger("Delete every Nth","Enter N:",minvalue=1)
+
+        def X(d):  # map mm → canvas x
+            return 60 + (W - 120) * d / total
+
+        cam_x, obj_x, bkg_x = X(0), X(ZA), X(total)
+        # camera/object/background lines
+        c.create_line(cam_x, top, cam_x, base, width=3)
+        c.create_line(obj_x, top, obj_x, base, fill="blue", width=3)
+        c.create_line(bkg_x, top, bkg_x, base, fill="green", width=3)
+
+        arrow = dict(arrow=tk.LAST, width=2)
+        c.create_line(cam_x, base, obj_x, base, fill="blue", **arrow)
+        c.create_line(obj_x, base - 18, bkg_x, base - 18, fill="green", **arrow)
+
+        # blur circle
+        pxmm = (W - 120) / total
+        r = max(4, min(coc_mm * pxmm / 2, 45))
+        c.create_oval(obj_x - r, top - r, obj_x + r, top + r, outline="red", width=2)
+
+        # labels
+        c.create_text((cam_x + obj_x) / 2, base + 12, text=f"ZA {ZA:.0f} mm", fill="blue")
+        c.create_text((obj_x + bkg_x) / 2, base - 6, text=f"ZD {ZD:.0f} mm", fill="green")
+        c.create_text(obj_x, top - r - 8, text="CoC", fill="red")
+
+    # ───────────────────────── file tools ──────────────────────────────
+    def export_checker(self):
+        fn = filedialog.asksaveasfilename(
+            defaultextension=".png", filetypes=[("PNG", "*.png")]
+        )
+        if not fn:
+            return
+        sz = int(self.v["square"].get())
+        gap = int(self.v["gap"].get())
+        generate_checkerboard(sz, gap, fn)
+        messagebox.showinfo("Checkerboard", f"Saved to:\n{fn}")
+
+    # ---- remove blank images: delete every n‑th ----------------------
+    def remove_images(self):
+        path = filedialog.askdirectory(title="Choose folder with images")
+        if not path:
+            return
+        n = simpledialog.askinteger("Remove images", "Delete every n‑th image (n≥2)?", minvalue=2)
         if not n:
             return
-        exts = ("*.png","*.jpg","*.jpeg","*.bmp","*.tif","*.tiff")
-        files = []
-        for e in exts:
-            files.extend(glob.glob(os.path.join(folder,e)))
-        files.sort()
-        deleted = 0
-        for i, f in enumerate(files, start=1):
-            if i % n == 0:
-                try:
-                    os.remove(f)
-                    deleted += 1
-                except:
-                    pass
-        messagebox.showinfo("Done", f"Deleted {deleted}/{len(files)} images")
+        imgs = sorted(
+            glob.glob(os.path.join(path, "*.*")),
+            key=lambda x: os.path.getmtime(x)
+        )
+        targets = imgs[n-1::n]
+        if not targets:
+            return messagebox.showinfo("No files", "Nothing to delete.")
+        if not messagebox.askyesno("Confirm", f"Delete {len(targets)} files?"):
+            return
+        for f in targets:
+            os.remove(f)
+        messagebox.showinfo("Done", f"Deleted {len(targets)} images.")
 
-    # ───────────────────────── Import & Measure ─────────────────────────
+    # ---- subtraction import / scrub window --------------------------
     def import_subtraction(self):
         files = filedialog.askopenfilenames(
-            title="Select images",
-            filetypes=[("Image files",("*.png","*.jpg","*.jpeg","*.bmp","*.tif","*.tiff"))]
+            title="Select images", filetypes=[("Images", "*.png;*.jpg;*.jpeg;*.bmp;*.tif;*.tiff")]
         )
         if not files:
             return
-        self.subtract_files = list(files)
-        self.first_gray = cv2.imread(files[0], cv2.IMREAD_GRAYSCALE)
-        self.measure_distance()  # directly launch
+        first = cv2.imread(files[0], cv2.IMREAD_GRAYSCALE)
+        self._scrub_state = {
+            "files": list(files),
+            "first": first,
+            "gain": 100,
+            "lp": 1,
+            "hp": 1,
+            "idx": 0,
+            "annotated": None,
+        }
+        self._open_scrub()
 
-    def measure_distance(self):
-        files = getattr(self, 'subtract_files', None)
-        first = getattr(self, 'first_gray', None)
-        if not files or first is None:
-            return messagebox.showerror("Error","No subtraction data")
+    # ---------- scrub window ----------------------------------------
+    def _open_scrub(self):
+        st = self._scrub_state
+        files, first = st["files"], st["first"]
 
-        count = len(files)
-        win = "Scrub & Filters (s=select, Esc=cancel)"
-        cv2.namedWindow(win, cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)
+        win = tk.Toplevel(self)
+        win.title("Scrub & Filters")
+        win.minsize(420, 320)
+        win.grid_rowconfigure(0, weight=1)
+        win.grid_columnconfigure(0, weight=1)
 
-        sel_idx  = [0]
-        gain_val = [100]
-        lp_val   = [1]
-        hp_val   = [1]
+        # preview label
+        lbl = tk.Label(win)
+        lbl.grid(row=0, column=0, sticky="nsew", padx=5, pady=5)
 
-        def update(idx):
-            gray = cv2.imread(files[idx], cv2.IMREAD_GRAYSCALE)
-            diff = cv2.subtract(gray, first)
-            scaled = cv2.convertScaleAbs(diff, alpha=gain_val[0]/100.0)
-            # low‑pass
-            k_lp = lp_val[0] | 1
-            lp_img = cv2.GaussianBlur(scaled,(k_lp,k_lp),0) if k_lp>1 else scaled
-            # high‑pass
-            k_hp = hp_val[0] | 1
-            if k_hp>1:
-                hp_blur = cv2.GaussianBlur(lp_img,(k_hp,k_hp),0)
+        # sliders frame
+        sf = ttk.Frame(win)
+        sf.grid(row=1, column=0, sticky="ew", padx=5)
+        sf.grid_columnconfigure((0, 1, 2, 3), weight=1)
+        sliders = {
+            "Frame": tk.Scale(sf, from_=0, to=len(files) - 1, orient="horizontal", label="Frame"),
+            "Gain": tk.Scale(sf, from_=0, to=2000, orient="horizontal", label="Gain x100"),
+            "LP": tk.Scale(sf, from_=1, to=99, orient="horizontal", label="Low‑pass"),
+            "HP": tk.Scale(sf, from_=1, to=99, orient="horizontal", label="High‑pass"),
+        }
+        sliders["Frame"].set(0)
+        sliders["Gain"].set(100)
+        sliders["LP"].set(1)
+        sliders["HP"].set(1)
+        for i, sc in enumerate(sliders.values()):
+            sc.grid(row=0, column=i, sticky="ew", padx=2)
+
+        # buttons
+        bf = ttk.Frame(win)
+        bf.grid(row=2, column=0, sticky="ew", pady=4, padx=5)
+        bf.grid_columnconfigure((0, 1, 2), weight=1)
+        ttk.Button(bf, text="Calibrate & Measure", command=lambda: self._calibrate_measure(st)).grid(
+            row=0, column=0, sticky="ew", padx=3
+        )
+        ttk.Button(bf, text="Export video", command=lambda: self._export_video(st)).grid(
+            row=0, column=1, sticky="ew", padx=3
+        )
+        ttk.Button(bf, text="Export snapshot", command=lambda: self._export_snapshot(st)).grid(
+            row=0, column=2, sticky="ew", padx=3
+        )
+
+        # update preview
+        def update(_=None):
+            idx = sliders["Frame"].get()
+            gain = sliders["Gain"].get()
+            lp = sliders["LP"].get() | 1
+            hp = sliders["HP"].get() | 1
+
+            img = cv2.imread(files[idx], cv2.IMREAD_GRAYSCALE)
+            diff = cv2.subtract(img, first)
+            scaled = cv2.convertScaleAbs(diff, alpha=gain / 100.0)
+            lp_img = cv2.GaussianBlur(scaled, (lp, lp), 0) if lp > 1 else scaled
+            if hp > 1:
+                hp_blur = cv2.GaussianBlur(lp_img, (hp, hp), 0)
                 out = cv2.subtract(lp_img, hp_blur)
             else:
                 out = lp_img
-            disp = cv2.cvtColor(out, cv2.COLOR_GRAY2BGR)
-            cv2.imshow(win, disp)
-            self.current_display = disp.copy()
 
-        cv2.createTrackbar("Frame",    win, 0,   count-1, lambda v:(sel_idx.__setitem__(0,v), update(v)))
-        cv2.createTrackbar("Gain x100",win,100, 2000,    lambda v:(gain_val.__setitem__(0,v), update(sel_idx[0])))
-        cv2.createTrackbar("Low‑pass", win, 1,   99,      lambda v:(lp_val.__setitem__(0,max(1,v)), update(sel_idx[0])))
-        cv2.createTrackbar("High‑pass",win, 1,   99,      lambda v:(hp_val.__setitem__(0,max(1,v)), update(sel_idx[0])))
+            # store current processed full‑res
+            st.update(idx=idx, gain=gain, lp=lp, hp=hp, processed=out)
 
-        update(0)
-        while True:
-            k = cv2.waitKey(50) & 0xFF
-            if k == ord('s'):
-                idx = sel_idx[0]
-                break
-            if k == 27:
-                idx = None
-                break
+            # scaled display
+            wlbl, hlbl = lbl.winfo_width(), lbl.winfo_height()
+            h0, w0 = out.shape
+            scale = min(wlbl / w0 if wlbl else 1, hlbl / h0 if hlbl else 1, 1.0)
+            disp = cv2.resize(out, (int(w0 * scale), int(h0 * scale)), interpolation=cv2.INTER_AREA)
+            rgb = cv2.cvtColor(disp, cv2.COLOR_GRAY2RGB)
+            imgtk = ImageTk.PhotoImage(Image.fromarray(rgb))
+            lbl.imgtk = imgtk
+            lbl.config(image=imgtk)
 
-        cv2.destroyWindow(win)
-        if idx is None:
+        # bind
+        for sc in sliders.values():
+            sc.config(command=update)
+        lbl.bind("<Configure>", lambda e: update())
+        update()
+
+    # -------------- calibration window -------------------------------
+    def _calibrate_measure(self, st):
+        if "processed" not in st:
             return
+        gray = st["processed"]
+        img = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
 
-        img = self.current_display.copy()
-        pts = []
-        cv2.namedWindow("Measure", cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)
-        cv2.imshow("Measure", img)
+        win = "Calibration & Measurement"
+        cv2.namedWindow(win, cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)
+        cv2.setWindowProperty(win, cv2.WND_PROP_TOPMOST, 1)
+        cv2.imshow(win, img)
 
-        def on_mouse(e, x, y, flags, param):
-            if e == cv2.EVENT_LBUTTONDOWN:
-                pts.append((x,y))
-                cv2.circle(img, (x,y), 5, (0,0,255), -1)
-                if len(pts)%2 == 0 and 'px_per_mm' in locals():
-                    (x1,y1),(x2,y2) = pts[-2], pts[-1]
-                    px = math.hypot(x2-x1, y2-y1)
-                    mm = px/px_per_mm
-                    cv2.line(img, (x1,y1),(x2,y2), (0,255,0), 2)
-                    cv2.putText(img, f"{mm:.2f} mm", (min(x1,x2),min(y1,y2)-10),
-                                cv2.FONT_HERSHEY_SIMPLEX,1,(0,255,0),2)
-                cv2.imshow("Measure", img)
+        pts, px_per_mm = [], None
 
-        cv2.setMouseCallback("Measure", on_mouse)
+        def on_mouse(evt, x, y, flags, _):
+            nonlocal px_per_mm, img
+            if evt == cv2.EVENT_LBUTTONDOWN:
+                cv2.circle(img, (x, y), 6, (0, 255, 255), -1)
+                pts.append((x, y))
+                cv2.imshow(win, img)
+
+                if len(pts) % 2 == 0 and px_per_mm is not None:
+                    (x1, y1), (x2, y2) = pts[-2], pts[-1]
+                    cv2.line(img, (x1, y1), (x2, y2), (0, 255, 255), 2)
+                    dist_px = math.hypot(x2 - x1, y2 - y1)
+                    dist_mm = dist_px / px_per_mm
+                    cv2.putText(
+                        img,
+                        f"{dist_mm:.2f} mm",
+                        (min(x1, x2), min(y1, y2) - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.8,
+                        (0, 255, 255),
+                        2,
+                    )
+                    cv2.imshow(win, img)
+
+        cv2.setMouseCallback(win, on_mouse)
         messagebox.showinfo("Calibrate", "Click 2 points to set scale")
         while len(pts) < 2:
             cv2.waitKey(50)
-        (cx1,cy1),(cx2,cy2) = pts[:2]
-        px_dist = math.hypot(cx2-cx1, cy2-cy1)
-        real_mm = simpledialog.askfloat("Calibrate","Enter real distance (mm):", minvalue=0.0)
-        if real_mm is None:
-            cv2.destroyWindow("Measure")
-            return
-        px_per_mm = px_dist/real_mm
-        messagebox.showinfo("Calibrated", f"{px_per_mm:.3f} px/mm")
-        messagebox.showinfo("Measure", "Click pairs to measure. Esc when done.")
 
+        real_mm = simpledialog.askfloat("Calibration", "Real distance (mm):", minvalue=0.0)
+        if not real_mm:
+            cv2.destroyWindow(win)
+            return
+        (x1, y1), (x2, y2) = pts[:2]
+        px_per_mm = math.hypot(x2 - x1, y2 - y1) / real_mm
+        messagebox.showinfo("Calibrated", f"{px_per_mm:.3f} px/mm\nEsc to finish measuring.")
         while True:
             if cv2.waitKey(50) & 0xFF == 27:
                 break
+        cv2.destroyWindow(win)
+        # store annotated
+        st["annotated"] = img
 
-        # final filtered video save
-        save_vid = filedialog.asksaveasfilename(defaultextension=".avi",
-            filetypes=[("AVI","*.avi"),("MP4","*.mp4")])
-        if save_vid:
-            fourcc = cv2.VideoWriter_fourcc(*'XVID')
-            h, w, _ = self.current_display.shape
-            vw = cv2.VideoWriter(save_vid, fourcc, 1.0, (w,h), False)
-            for f in files:
-                gray = cv2.imread(f, cv2.IMREAD_GRAYSCALE)
-                diff = cv2.subtract(gray, first)
-                scaled = cv2.convertScaleAbs(diff, alpha=gain_val[0]/100.0)
-                k_lp = lp_val[0] | 1
-                lp_img = cv2.GaussianBlur(scaled,(k_lp,k_lp),0) if k_lp>1 else scaled
-                k_hp = hp_val[0] | 1
-                if k_hp>1:
-                    hp_blur = cv2.GaussianBlur(lp_img,(k_hp,k_hp),0)
-                    out = cv2.subtract(lp_img, hp_blur)
-                else:
-                    out = lp_img
-                vw.write(out)
-            vw.release()
-            messagebox.showinfo("Saved", f"Filtered video saved to:\n{save_vid}")
+    # -------------- export helpers ----------------------------------
+    def _export_video(self, st):
+        fn = filedialog.asksaveasfilename(defaultextension=".avi", filetypes=[("AVI", "*.avi")])
+        if not fn:
+            return
+        files, first = st["files"], st["first"]
+        gain, lp, hp = st["gain"], st["lp"], st["hp"]
+        h, w = st["processed"].shape
+        vw = cv2.VideoWriter(fn, cv2.VideoWriter_fourcc(*"XVID"), 1.0, (w, h), False)
+        for f in files:
+            g = cv2.imread(f, cv2.IMREAD_GRAYSCALE)
+            diff = cv2.subtract(g, first)
+            scaled = cv2.convertScaleAbs(diff, alpha=gain / 100.0)
+            lp_img = cv2.GaussianBlur(scaled, (lp, lp), 0) if lp > 1 else scaled
+            if hp > 1:
+                hp_blur = cv2.GaussianBlur(lp_img, (hp, hp), 0)
+                out = cv2.subtract(lp_img, hp_blur)
+            else:
+                out = lp_img
+            vw.write(out)
+        vw.release()
+        messagebox.showinfo("Video", f"Saved video:\n{fn}")
 
-        # snapshot
-        snap = filedialog.asksaveasfilename(defaultextension=".png", filetypes=[("PNG","*.png")])
-        if snap:
-            cv2.imwrite(snap, img)
-            messagebox.showinfo("Saved", f"Snapshot saved to:\n{snap}")
-        cv2.destroyWindow("Measure")
+    def _export_snapshot(self, st):
+        out = st.get("annotated", st.get("processed"))
+        if out is None:
+            return messagebox.showerror("Snapshot", "Nothing to save")
+        fn = filedialog.asksaveasfilename(defaultextension=".png", filetypes=[("PNG", "*.png")])
+        if not fn:
+            return
+        cv2.imwrite(fn, out)
+        messagebox.showinfo("Snapshot", f"Saved snapshot:\n{fn}")
 
-    # ──────────────────────────── Schematic & Help ───────────────────────────
-    def _draw_schematic(self, ZA, ZD, CoC):
-        c = self.canvas; c.delete("all")
-        W, H = 560, 155; top, base = 40, H-30; total = ZA + ZD
-        X = lambda d: 60 + d/total*(W-120)
-        cam, obj, bkg = X(0), X(ZA), X(total)
-        for x, col in ((cam,"black"), (obj,"blue"), (bkg,"green")):
-            c.create_line(x, top, x, base, fill=col, width=3)
-        arrow = dict(arrow=tk.LAST, width=2)
-        c.create_line(cam, base, obj, base, fill="blue", **arrow)
-        c.create_line(obj, base-20, bkg, base-20, fill="green", **arrow)
-        pxmm = (W-120)/total; r_px = max(4, min(CoC*pxmm/2,45))
-        c.create_oval(obj-r_px, top-r_px, obj+r_px, top+r_px, outline="red", width=2)
-        c.create_text((cam+obj)/2, base+12, text=f"ZA {ZA:.0f} mm", fill="blue")
-        c.create_text((obj+bkg)/2, base-8, text=f"ZD {ZD:.0f} mm", fill="green")
-        c.create_text(obj, top-r_px-8, text="blur", fill="red")
+    # ───────────────────── geometry helper ───────────────────────────
+    def _solve_geometry(self, S_req, f, ZA, ZD, ZB):
+        if ZB and (ZA or ZD):
+            raise ValueError("Use ZB or ZA/ZD—not both.")
+        if ZA is not None and ZD is not None:
+            return ZA, ZD
+        if ZA is not None:
+            ZD = solve_ZD(S_req, f, ZA)
+            return ZA, ZD
+        if ZD is not None:
+            ZA = solve_ZA(S_req, f, ZD)
+            return ZA, ZD
+        # nothing known → pick ZA≈ZD≈ZB/2 then scale to S_req
+        ZBv = ZB or 1000
+        ZA = ZBv / 2
+        ZD = ZBv - ZA
+        S0 = sensitivity(f, ZA, ZD)
+        ZD *= S_req / S0
+        ZA = ZBv - ZD
+        if ZA <= f:
+            raise ValueError("Cannot fit ZA>f in chosen ZB.")
+        return ZA, ZD
 
+    # ─────────────────────────── help ────────────────────────────────
     def show_help(self):
-        messagebox.showinfo("Parameters Explanation",
-            "FOV      – field‑of‑view width in object plane (mm)\n"
-            "Sensor   – sensor size along FOV axis (mm)\n"
-            "Pixels   – number of pixels along that axis\n"
-            "Object   – target feature size (mm)\n"
-            "f‑number – lens aperture ratio\n"
-            "focal    – lens focal length (mm)\n"
-            "ZA       – camera→object distance (mm)\n"
-            "ZD       – object→background distance (mm)\n"
-            "ZB       – total camera→background span (mm)\n"
-            "Checker sq/spacing – checkerboard px sizes\n\n"
-            "Tools:\n"
-            "  • Remove blank images\n"
-            "  • Import images for subtraction → scrub/gain/filters + measure"
+        messagebox.showinfo(
+            "Parameter help",
+            "FOV – object‑plane field width captured by sensor\n"
+            "Sensor – physical sensor length along FOV axis\n"
+            "Pixels – number of pixels along that axis\n"
+            "Object – size of feature you need to resolve\n"
+            "f‑number – lens f/‑ratio (aperture)\n"
+            "Focal – lens focal length\n"
+            "ZA – camera→object (mm), ZD – object→background (mm).\n"
+            "Leave ZA or ZD blank to let program solve it.",
         )
+
 
 if __name__ == "__main__":
     BOSGui().mainloop()
