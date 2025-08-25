@@ -330,7 +330,7 @@ class BOSGui(tk.Tk):
         sf.grid_columnconfigure((0, 1, 2, 3), weight=1)
         sliders = {
             "Frame": tk.Scale(sf, from_=0, to=len(files) - 1, orient="horizontal", label="Frame"),
-            "Gain": tk.Scale(sf, from_=0, to=2000, orient="horizontal", label="Gain x100"),
+            "Gain": tk.Scale(sf, from_=0, to=15000, orient="horizontal", label="Gain x100"),
             "LP": tk.Scale(sf, from_=1, to=99, orient="horizontal", label="Low‑pass"),
             "HP": tk.Scale(sf, from_=1, to=99, orient="horizontal", label="High‑pass"),
         }
