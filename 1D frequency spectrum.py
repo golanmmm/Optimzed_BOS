@@ -1,43 +1,37 @@
 #!/usr/bin/env python3
 """
-Wave-frequency analyzer with:
-- 2-point physical calibration (mm -> µm/px)
-- Background removal (local-mean subtraction via Gaussian, radius in mm)
-- Band-pass filtering (low/high cutoffs in cycles/mm) for both image (2D) and line profile (1D)
-- Standing-wave helpers (intensity case -> λ_field = 2/ν_peak)
+Interactive wave-frequency analyzer (real-time sliders)
 
-Steps:
-1) Pick an image.
-2) CALIBRATION: click two points with known real distance; enter that distance in mm.
-3) CLEANUP:
-   - Enter background radius (mm) for local-mean subtraction (0 = skip).
-   - Enter low/high cutoffs (cycles/mm) for band-pass (blank = default).
-4) ANALYSIS: click two points to define the line.
-5) View: filtered image+line, 1D profile (orig vs filtered), 1D FFT (orig vs filtered, cycles/mm),
-   and 2D FFT (log) of the filtered image with axes in cycles/mm.
-6) Optionally enter wave speed (m/s) to estimate temporal frequency (Hz/MHz).
+Features
+- 2-point physical calibration (click two points with known separation; enter mm)
+- Live background removal (Gaussian local mean) controlled via slider [mm]
+- Live annular 2D band-pass (low/high cutoffs) controlled via sliders [cycles/mm]
+- Click to reselect the analysis line in the same window (button)
+- 1D profile & 1D FFT (orig vs filtered), 2D FFT (log) with axes in cycles/mm
+- Optional wave speed input; top x-axis shows temporal frequency in Hz/MHz
+- “Intensity ÷2” toggle so standing-wave intensity gives the *true* field frequency
 
-Requirements: numpy, matplotlib, scikit-image, tkinter
+Requirements
     pip install numpy matplotlib scikit-image
 """
 
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
+from matplotlib.widgets import Slider, Button, CheckButtons, TextBox
 from tkinter import Tk, filedialog, simpledialog, messagebox
 from skimage import io, color
 from skimage.filters import gaussian
 from skimage.measure import profile_line
 
-
-# ---------- Small helpers ----------
-def info(msg, title="Info"):
+# -------------------- Basic UI helpers (tkinter) --------------------
+def msg_info(msg, title="Info"):
     root = Tk(); root.withdraw(); root.update()
     messagebox.showinfo(title, msg)
     root.destroy()
 
 def ask_float(title, prompt, initial=None, minvalue=None):
-    """Fixed: uses 'minvalue' (matches tkinter.simpledialog.askfloat)."""
+    """Uses tkinter.simpledialog.askfloat with 'minvalue' (fixed)."""
     root = Tk(); root.withdraw(); root.update()
     val = simpledialog.askfloat(title, prompt, initialvalue=initial, minvalue=minvalue)
     root.destroy()
@@ -61,17 +55,17 @@ def pick_file():
         raise SystemExit("No file selected.")
     return path
 
-def select_two_points(gray, title):
-    fig, ax = plt.subplots(figsize=(7, 7))
-    ax.imshow(gray, cmap="gray", interpolation="nearest")
-    ax.set_title(title + "\n(click TWO points, then close this window)")
-    ax.set_axis_off()
-    pts = plt.ginput(2, timeout=0)
-    plt.close(fig)
-    if len(pts) != 2:
-        raise SystemExit("Two points not selected.")
-    (x0, y0), (x1, y1) = pts
-    return (x0, y0), (x1, y1)
+# -------------------- Core helpers --------------------
+def to_grayscale_float(img):
+    if img.ndim == 3:
+        if img.shape[2] == 4:
+            img = img[..., :3]
+        img = color.rgb2gray(img)
+    img = img.astype(np.float32)
+    # normalize if looks like 0..255 range
+    if img.max() > 1.5:
+        img = (img - img.min()) / (img.max() - img.min() + 1e-12)
+    return img
 
 def normalize01(a):
     a = np.asarray(a, dtype=np.float32)
@@ -80,97 +74,70 @@ def normalize01(a):
         return (a - mn) / (mx - mn)
     return np.zeros_like(a)
 
-def to_grayscale_float(img):
-    if img.ndim == 3:
-        if img.shape[2] == 4:
-            img = img[..., :3]
-        img = color.rgb2gray(img)
-    img = img.astype(np.float32)
-    if img.max() > 1.5:
-        img = (img - img.min()) / (img.max() - img.min() + 1e-12)
-    return img
-
-
-# ---------- Frequency-domain helpers ----------
-def compute_2d_fft(gray):
-    F = np.fft.fft2(gray)
-    Fshift = np.fft.fftshift(F)
-    mag = np.abs(Fshift)
-    mag_log = np.log1p(mag)
-    mag_log /= (mag_log.max() + 1e-12)
-    return mag_log
-
-def bandpass_2d_fft(image, mm_per_px, low_cmm=None, high_cmm=None):
-    """
-    Ideal (hard) annular mask in 2D frequency domain.
-    low_cmm, high_cmm are cutoffs in cycles/mm. Use None/0 to disable a side.
-    """
-    H, W = image.shape
-    # Frequency grids in cycles/pixel
-    fx = np.fft.fftshift(np.fft.fftfreq(W, d=1.0))
-    fy = np.fft.fftshift(np.fft.fftfreq(H, d=1.0))
-    FX, FY = np.meshgrid(fx, fy)
-    R_c_per_px = np.sqrt(FX**2 + FY**2)  # radial frequency in cycles/pixel
-
-    # cycles/mm -> cycles/pixel
-    def to_c_per_px(cmm):
-        return cmm * mm_per_px
-
-    low_cpx = to_c_per_px(low_cmm) if (low_cmm is not None and low_cmm > 0) else 0.0
-    high_cpx = to_c_per_px(high_cmm) if (high_cmm is not None and high_cmm > 0) else None
-
-    F = np.fft.fft2(image)
-    Fshift = np.fft.fftshift(F)
-
-    mask = np.ones_like(R_c_per_px, dtype=bool)
-    if low_cpx > 0:
-        mask &= (R_c_per_px >= low_cpx)
-    if high_cpx is not None:
-        mask &= (R_c_per_px <= high_cpx)
-
-    Fshift_f = Fshift * mask
-    If = np.fft.ifft2(np.fft.ifftshift(Fshift_f)).real
-    return If
-
 def gaussian_background_subtract(image, radius_mm, mm_per_px):
-    """
-    Subtract local mean estimated by Gaussian blur with sigma = radius_px.
-    radius_mm = 0 or None -> skip (return original).
-    """
+    """Subtract local mean estimated by Gaussian blur with sigma = radius_px."""
     if radius_mm is None or radius_mm <= 0:
         return image
     sigma_px = max(radius_mm / mm_per_px, 0.0)
     if sigma_px < 1e-6:
         return image
     bg = gaussian(image, sigma=sigma_px, preserve_range=True)
-    out = image - bg
+    return image - bg
+
+def bandpass_2d_fft(image, mm_per_px, low_cmm=None, high_cmm=None):
+    """Hard annular mask in 2D frequency domain: keep low<=|f|<=high (in cycles/mm)."""
+    H, W = image.shape
+    # frequency grids in cycles/pixel
+    fx = np.fft.fftshift(np.fft.fftfreq(W, d=1.0))
+    fy = np.fft.fftshift(np.fft.fftfreq(H, d=1.0))
+    FX, FY = np.meshgrid(fx, fy)
+    R_cpx = np.sqrt(FX**2 + FY**2)  # radial cycles/pixel
+
+    def cmm_to_cpx(cmm):
+        return (cmm or 0.0) * mm_per_px
+
+    low_cpx  = cmm_to_cpx(low_cmm)
+    high_cpx = cmm_to_cpx(high_cmm) if (high_cmm is not None and high_cmm > 0) else None
+
+    F = np.fft.fft2(image)
+    Fsh = np.fft.fftshift(F)
+    mask = np.ones_like(R_cpx, dtype=bool)
+    if low_cpx > 0:
+        mask &= (R_cpx >= low_cpx)
+    if high_cpx is not None:
+        mask &= (R_cpx <= high_cpx)
+    Ff = Fsh * mask
+    out = np.fft.ifft2(np.fft.ifftshift(Ff)).real
     return out
+
+def compute_2d_fft_display(gray):
+    F = np.fft.fft2(gray)
+    Fsh = np.fft.fftshift(F)
+    mag = np.abs(Fsh)
+    mag_log = np.log1p(mag)
+    return normalize01(mag_log)
 
 def line_fft(profile):
     n = len(profile)
-    profile = profile - np.mean(profile)
-    if n > 1:
-        # light taper to reduce leakage
-        w = np.hanning(n)
-        profile = profile * w
-    spec = np.fft.fft(profile)
-    freqs_px = np.fft.fftfreq(n, d=1.0)  # cycles per pixel
-    mag = np.abs(spec) / max(n, 1)
+    if n < 2:
+        return np.array([0.0]), np.array([0.0])
+    prof = profile - np.mean(profile)
+    prof = prof * np.hanning(n)  # light taper
+    spec = np.fft.fft(prof)
+    freqs_px = np.fft.fftfreq(n, d=1.0)     # cycles/pixel
+    mag = np.abs(spec) / n
     return freqs_px, mag
 
 def bandpass_1d_fft(profile, mm_per_px, low_cmm=None, high_cmm=None):
-    """
-    Band-pass the 1D profile via FFT masking.
-    """
     n = len(profile)
     spec = np.fft.fft(profile - np.mean(profile))
-    freqs_px = np.fft.fftfreq(n, d=1.0)  # cycles/pixel
+    freqs_px = np.fft.fftfreq(n, d=1.0)
 
-    def to_c_per_px(cmm):
-        return cmm * mm_per_px
+    def cmm_to_cpx(cmm):
+        return (cmm or 0.0) * mm_per_px
 
-    low_cpx = to_c_per_px(low_cmm) if (low_cmm is not None and low_cmm > 0) else 0.0
-    high_cpx = to_c_per_px(high_cmm) if (high_cmm is not None and high_cmm > 0) else None
+    low_cpx  = cmm_to_cpx(low_cmm)
+    high_cpx = cmm_to_cpx(high_cmm) if (high_cmm is not None and high_cmm > 0) else None
 
     mask = np.ones_like(freqs_px, dtype=bool)
     if low_cpx > 0:
@@ -179,213 +146,368 @@ def bandpass_1d_fft(profile, mm_per_px, low_cmm=None, high_cmm=None):
         mask &= (np.abs(freqs_px) <= high_cpx)
 
     spec_f = spec * mask
-    prof_f = np.fft.ifft(spec_f).real
-    return prof_f
+    return np.fft.ifft(spec_f).real
 
-
-# ---------- Main ----------
+# -------------------- Main (interactive) --------------------
 def main():
-    # 1) Image
+    # 1) Load + grayscale
     path = pick_file()
     img = io.imread(path)
     gray0 = to_grayscale_float(img)
 
-    # 2) CALIBRATION: two points + known distance (mm)
-    (cx0, cy0), (cx1, cy1) = select_two_points(
-        gray0, "CALIBRATION: choose two points with a known real distance"
-    )
-    pixel_distance = float(np.hypot(cx1 - cx0, cy1 - cy0))  # px
-    known_mm = ask_float(
-        "Calibration distance",
-        "Enter known distance between the two points (mm):",
-        initial=1.0, minvalue=1e-12
-    )
+    # 2) CALIBRATION: click two points, enter known distance (mm)
+    fig_cal, ax_cal = plt.subplots(figsize=(7, 7))
+    ax_cal.imshow(gray0, cmap="gray", interpolation="nearest")
+    ax_cal.set_title("CALIBRATION: click TWO points with known real distance\nClose window when done.")
+    ax_cal.set_axis_off()
+    cal_pts = plt.ginput(2, timeout=0)
+    plt.close(fig_cal)
+    if len(cal_pts) != 2:
+        raise SystemExit("Calibration requires two points.")
+    (cx0, cy0), (cx1, cy1) = cal_pts
+    pixel_distance = float(np.hypot(cx1 - cx0, cy1 - cy0))
+    known_mm = ask_float("Calibration distance",
+                         "Enter known distance between the two points (mm):",
+                         initial=1.0, minvalue=1e-12)
     if known_mm is None:
         raise SystemExit("Calibration distance is required.")
-    um_per_px = (known_mm * 1000.0) / pixel_distance   # µm/px
-    mm_per_px = um_per_px / 1000.0                     # mm/px
-    px_m = mm_per_px * 1e-3                            # m/px
-
-    # Nyquist (cycles/mm)
+    um_per_px = (known_mm * 1000.0) / pixel_distance
+    mm_per_px = um_per_px / 1000.0
+    px_m = mm_per_px * 1e-3
     nyq_cmm = 1.0 / (2.0 * mm_per_px)
 
-    # 3) CLEANUP PARAMETERS
-    bg_radius_mm = ask_float(
-        "Background removal",
-        "Enter local-mean radius (mm) for background subtraction (0 = skip):",
-        initial=0.2, minvalue=0.0
-    )
-    cuts = ask_string(
-        "Band-pass cutoffs",
-        f"Enter low,high cutoffs in cycles/mm (comma-separated).\n"
-        f"Examples: 0, {nyq_cmm:.3g}  (no HP / no LP)\n"
-        f"           0.2, 4\n"
-        f"Leave blank for default (0 to Nyquist ≈ {nyq_cmm:.3g})."
-    )
-    low_cmm = 0.0
-    high_cmm = nyq_cmm
-    if cuts:
-        try:
-            parts = [p.strip() for p in cuts.split(",")]
-            if len(parts) >= 1 and parts[0] != "":
-                low_cmm = max(0.0, float(parts[0]))
-            if len(parts) >= 2 and parts[1] != "":
-                high_cmm = float(parts[1])
-        except Exception:
-            info("Could not parse cutoffs. Using defaults.", "Band-pass")
-    if high_cmm is None or high_cmm <= 0:
-        high_cmm = nyq_cmm
-    low_cmm = max(0.0, min(low_cmm, nyq_cmm))
-    high_cmm = max(low_cmm + 1e-9, min(high_cmm, nyq_cmm))  # ensure low < high
+    # 3) Initial parameters
+    init_bg_mm = 0.2
+    init_low_cmm = 0.0
+    init_high_cmm = nyq_cmm
+    init_speed = "1540"  # typical soft tissue (m/s)
+    intensity_case = True  # default to intensity ÷2
 
-    # Apply cleanup to image: background removal -> 2D band-pass
-    gray_bg = gaussian_background_subtract(gray0, bg_radius_mm, mm_per_px)
-    gray1 = bandpass_2d_fft(gray_bg, mm_per_px, low_cmm=low_cmm, high_cmm=high_cmm)
-    gray_disp = normalize01(gray1)
+    # 4) Build interactive figure (4 plots + controls)
+    plt.close("all")
+    fig = plt.figure(figsize=(14, 11))
+    gs = fig.add_gridspec(3, 4, height_ratios=[1, 1, 0.18], left=0.05, right=0.98, top=0.92, bottom=0.08, hspace=0.32, wspace=0.25)
 
-    # Optional wave speed (for temporal freq estimate)
-    speed_str = ask_string(
-        "Wave speed (optional)",
-        "Enter wave speed in m/s (e.g., 1480 water, 1540 tissue).\nLeave blank to skip:"
-    )
-    v_mps = None
-    if speed_str:
-        try:
-            v_mps = float(speed_str)
-            if v_mps <= 0:
-                v_mps = None
-        except ValueError:
-            info("Could not parse wave speed. Proceeding without it.", "Wave speed")
+    ax_img  = fig.add_subplot(gs[0, 0])
+    ax_fft2 = fig.add_subplot(gs[0, 1])
+    ax_prof = fig.add_subplot(gs[1, 0])
+    ax_spec = fig.add_subplot(gs[1, 1])
 
-    # 4) ANALYSIS LINE
-    (x0, y0), (x1, y1) = select_two_points(
-        gray_disp, "ANALYSIS: choose two points to define the line"
-    )
+    # (Use the two extra columns for wide plots / future expansion)
+    # Put controls in the bottom row spanning columns
+    ax_bg_sl   = fig.add_subplot(gs[2, 0])
+    ax_low_sl  = fig.add_subplot(gs[2, 1])
+    ax_high_sl = fig.add_subplot(gs[2, 2])
+    ax_btns    = fig.add_subplot(gs[2, 3])
 
-    # Profiles: original + filtered-image
-    prof_orig = profile_line(gray0, (y0, x0), (y1, x1),
-                             mode="reflect", order=1, linewidth=1, reduce_func=None)
-    if prof_orig.ndim > 1:
-        prof_orig = prof_orig.mean(axis=1)
-    prof_imgfilt = profile_line(gray_disp, (y0, x0), (y1, x1),
-                                mode="reflect", order=1, linewidth=1, reduce_func=None)
-    if prof_imgfilt.ndim > 1:
-        prof_imgfilt = prof_imgfilt.mean(axis=1)
+    # Prepare state
+    state = {
+        "mm_per_px": mm_per_px,
+        "px_m": px_m,
+        "nyq_cmm": nyq_cmm,
+        "gray0": gray0,
+        "bg_mm": init_bg_mm,
+        "low_cmm": init_low_cmm,
+        "high_cmm": init_high_cmm,
+        "v_mps": float(init_speed),
+        "use_speed": True,
+        "intensity_case": intensity_case,
+        "line_pts": None,  # ((x0,y0),(x1,y1))
+        "selecting_line": False,
+        "secax": None,     # secondary x-axis handle
+        "img_artist": None,
+        "line_artist": None,
+        "fft2_artist": None,
+        "prof_lines": [],
+        "spec_lines": [],
+        "peak_line": None,
+        "peak_text": None,
+        "extent": None,
+    }
 
-    # Additional 1D band-pass on the profile (helps for noisy lines)
-    prof_bp = bandpass_1d_fft(prof_imgfilt, mm_per_px, low_cmm=low_cmm, high_cmm=high_cmm)
+    # ---------- Controls ----------
+    sl_bg   = Slider(ax_bg_sl,   "BG radius (mm)", 0.0, 5.0, valinit=init_bg_mm)
+    sl_low  = Slider(ax_low_sl,  "Low c/mm", 0.0, nyq_cmm, valinit=init_low_cmm)
+    sl_high = Slider(ax_high_sl, "High c/mm", 0.0, nyq_cmm, valinit=init_high_cmm)
 
-    # FFTs (orig vs filtered)
-    freqs_px_o, mag_o = line_fft(prof_orig)
-    freqs_px_f, mag_f = line_fft(prof_bp)
-    freqs_cmm_o = freqs_px_o / mm_per_px
-    freqs_cmm_f = freqs_px_f / mm_per_px
+    # Buttons + toggles
+    ax_btns.axis("off")
+    # small axes inside ax_btns for widgets
+    btn_reselect_ax = fig.add_axes([ax_btns.get_position().x0, ax_btns.get_position().y0+0.06, 0.10, 0.05])
+    btn_reselect = Button(btn_reselect_ax, "Reselect line")
 
-    # Dominant non-DC peak from filtered
-    if len(mag_f) > 1:
-        idx_peak = 1 + np.argmax(mag_f[1:])
-    else:
-        idx_peak = 0
-    fpk_cmm = max(freqs_cmm_f[idx_peak], 0.0)
+    chk_ax = fig.add_axes([ax_btns.get_position().x0+0.12, ax_btns.get_position().y0+0.06, 0.12, 0.08])
+    chk = CheckButtons(chk_ax, ["Intensity ÷2", "Show Hz axis"], [state["intensity_case"], state["use_speed"]])
 
-    # Wavelengths
-    lambda_direct_mm = (1.0 / fpk_cmm) if fpk_cmm > 0 else np.inf
-    lambda_intensity_mm = (2.0 / fpk_cmm) if fpk_cmm > 0 else np.inf  # standing-wave intensity case
+    txt_ax = fig.add_axes([ax_btns.get_position().x0+0.26, ax_btns.get_position().y0+0.06, 0.18, 0.05])
+    txt = TextBox(txt_ax, "Speed m/s: ", initial=init_speed)
 
-    # Optional temporal frequency estimate
-    f_direct_Hz = f_intensity_Hz = None
-    if v_mps and np.isfinite(lambda_direct_mm):
-        lambda_direct_m = lambda_direct_mm * 1e-3
-        lambda_intensity_m = lambda_intensity_mm * 1e-3
-        f_direct_Hz = v_mps / lambda_direct_m if lambda_direct_m > 0 else None
-        f_intensity_Hz = v_mps / lambda_intensity_m if lambda_intensity_m > 0 else None
+    # ---------- Helper functions that depend on state ----------
+    def update_filters():
+        """Apply background removal + 2D band-pass to image; update 2D FFT extent."""
+        gray_bg = gaussian_background_subtract(state["gray0"], state["bg_mm"], state["mm_per_px"])
+        gray_f = bandpass_2d_fft(gray_bg, state["mm_per_px"], state["low_cmm"], state["high_cmm"])
+        disp = normalize01(gray_f)
 
-    # 2D FFT (of filtered image) with physical axes
-    f2d = compute_2d_fft(gray1)
-    H, W = gray1.shape
-    fx_m = np.fft.fftshift(np.fft.fftfreq(W, d=px_m))  # cycles/m
-    fy_m = np.fft.fftshift(np.fft.fftfreq(H, d=px_m))
-    fx_mm = fx_m / 1000.0
-    fy_mm = fy_m / 1000.0
-    extent = [fx_mm[0], fx_mm[-1], fy_mm[0], fy_mm[-1]]
+        # 2D FFT (for display) + physical frequency axes extent in cycles/mm
+        f2d = compute_2d_fft_display(gray_f)
+        H, W = gray_f.shape
+        fx_m = np.fft.fftshift(np.fft.fftfreq(W, d=state["px_m"]))  # cycles/m
+        fy_m = np.fft.fftshift(np.fft.fftfreq(H, d=state["px_m"]))
+        fx_mm = fx_m / 1000.0
+        fy_mm = fy_m / 1000.0
+        extent = [fx_mm[0], fx_mm[-1], fy_mm[0], fy_mm[-1]]
 
-    # ---- Plots ----
-    fig, axes = plt.subplots(2, 2, figsize=(14, 11))
+        return disp, f2d, extent
 
-    ax = axes[0, 0]
-    ax.imshow(gray_disp, cmap="gray", interpolation="nearest")
-    ax.plot([x0, x1], [y0, y1], "-r", lw=2)
-    ax.scatter([x0, x1], [y0, y1], c="yellow", s=40)
-    ax.set_title("Filtered image (bg removed + band-pass) with analysis line")
-    ax.set_axis_off()
+    def ensure_line():
+        """If no line yet, let the user click two points on the image."""
+        if state["line_pts"] is not None:
+            return
+        ax_img.set_title("Click TWO points to define the analysis line")
+        fig.canvas.draw_idle()
+        pts = plt.ginput(2, timeout=0)
+        if len(pts) != 2:
+            msg_info("Two points required for analysis line.", "Line selection")
+            return
+        state["line_pts"] = (pts[0], pts[1])
+        ax_img.set_title("Filtered image with analysis line")
 
-    ax = axes[0, 1]
-    im = ax.imshow(f2d, cmap="gray", extent=extent, origin="lower", aspect="auto")
-    ax.set_title("2D FFT magnitude (log) of filtered image")
-    ax.set_xlabel("fx (cycles/mm)")
-    ax.set_ylabel("fy (cycles/mm)")
-    cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    cbar.set_label("Norm. log magnitude")
+    def current_profiles(img_disp):
+        """Return (profile_original, profile_filteredDisplay) along the current line."""
+        if state["line_pts"] is None:
+            return None, None
+        (x0, y0), (x1, y1) = state["line_pts"]
+        p0 = profile_line(state["gray0"], (y0, x0), (y1, x1), mode="reflect", order=1, linewidth=1, reduce_func=None)
+        p1 = profile_line(img_disp,            (y0, x0), (y1, x1), mode="reflect", order=1, linewidth=1, reduce_func=None)
+        if getattr(p0, "ndim", 1) > 1: p0 = p0.mean(axis=1)
+        if getattr(p1, "ndim", 1) > 1: p1 = p1.mean(axis=1)
+        return p0, p1
 
-    ax = axes[1, 0]
-    x_pix = np.linspace(0, 1, len(prof_orig)) * len(prof_orig)
-    ax.plot(x_pix, prof_orig, lw=1.1, label="Original")
-    ax.plot(x_pix, prof_bp, lw=1.4, label="Filtered (bg+BP)")
-    ax.set_xlabel("Distance along line (pixels)")
-    ax.set_ylabel("Intensity")
-    ax.set_title("Line intensity profile (orig vs filtered)")
-    ax.legend(loc="best")
-    ax.grid(True, alpha=0.25)
+    def compute_spectrum(profile, low_cmm, high_cmm):
+        """Return (freqs_c/mm, mag, peak_freq_c/mm, lambda_direct_mm, lambda_int_mm, f_direct_Hz, f_int_Hz)"""
+        if profile is None or len(profile) < 2:
+            return (np.array([0.0]), np.array([0.0]), 0.0, np.inf, np.inf, None, None)
 
-    ax = axes[1, 1]
-    ax.plot(freqs_cmm_o, mag_o, lw=1.0, label="Original")
-    ax.plot(freqs_cmm_f, mag_f, lw=1.6, label="Filtered (bg+BP)")
-    ax.set_xlim(0, nyq_cmm)
-    ax.set_xlabel("Spatial frequency (cycles/mm)")
-    ax.set_ylabel("Magnitude")
-    ax.set_title("1D FFT along line")
-    ax.grid(True, alpha=0.3)
-    ax.legend(loc="best")
-    if np.isfinite(fpk_cmm) and fpk_cmm > 0:
-        ax.axvline(fpk_cmm, ls="--", lw=1)
-        ax.text(fpk_cmm, max(mag_f)*0.9, f"peak ≈ {fpk_cmm:.3g} c/mm",
-                rotation=90, va="top", ha="right")
+        prof_bp = bandpass_1d_fft(profile, state["mm_per_px"], low_cmm, high_cmm)
+        freqs_px, mag = line_fft(prof_bp)
+        freqs_cmm = freqs_px / state["mm_per_px"]
 
-    # Optional top x-axis for temporal frequency if v given
-    if v_mps:
-        def cmm_to_Hz(x):
-            return v_mps * (x * 1000.0)  # cycles/mm -> cycles/m -> Hz
-        def Hz_to_cmm(x):
-            return x / (v_mps * 1000.0)
+        if len(mag) > 1:
+            idx_peak = 1 + np.argmax(mag[1:])  # skip DC
+        else:
+            idx_peak = 0
+        fpk_cmm = max(freqs_cmm[idx_peak], 0.0)
+
+        lam_direct_mm = (1.0 / fpk_cmm) if fpk_cmm > 0 else np.inf
+        lam_int_mm = (2.0 / fpk_cmm) if fpk_cmm > 0 else np.inf
+
+        f_direct = f_int = None
+        v = state["v_mps"] if state["use_speed"] else None
+        if v and np.isfinite(lam_direct_mm):
+            lam_d_m = lam_direct_mm * 1e-3
+            lam_i_m = lam_int_mm * 1e-3
+            f_direct = v / lam_d_m if lam_d_m > 0 else None
+            f_int = v / lam_i_m if lam_i_m > 0 else None
+
+        return freqs_cmm, mag, fpk_cmm, lam_direct_mm, lam_int_mm, f_direct, f_int
+
+    def set_top_axis(ax, use_speed, intensity_case):
+        """Create/update the secondary x-axis mapping cycles/mm -> Hz (or hide)."""
+        if state["secax"] is not None:
+            # Reset/remove previous
+            try:
+                state["secax"].remove()
+            except Exception:
+                pass
+            state["secax"] = None
+
+        if not use_speed:
+            fig.canvas.draw_idle()
+            return
+
+        v = state["v_mps"]
+        if v is None or v <= 0:
+            fig.canvas.draw_idle()
+            return
+
+        if intensity_case:
+            # f = v * (nu*1000)/2  (nu in cycles/mm)
+            def cmm_to_Hz(x): return v * (x * 1000.0) / 2.0
+            def Hz_to_cmm(x): return (x * 2.0) / (v * 1000.0)
+            label = "Temporal frequency (Hz) — INTENSITY (÷2)"
+        else:
+            # field case: f = v * (nu*1000)
+            def cmm_to_Hz(x): return v * (x * 1000.0)
+            def Hz_to_cmm(x): return x / (v * 1000.0)
+            label = "Temporal frequency (Hz) — FIELD"
+
         secax = ax.secondary_xaxis('top', functions=(cmm_to_Hz, Hz_to_cmm))
-        secax.set_xlabel("Temporal frequency (Hz)")
-        def fmt_Hz(val, _pos):
-            return f"{val/1e6:.3g} MHz" if abs(val) >= 1e6 else f"{val:.3g} Hz"
-        secax.xaxis.set_major_formatter(mticker.FuncFormatter(fmt_Hz))
+        secax.set_xlabel(label)
+        secax.xaxis.set_major_formatter(mticker.FuncFormatter(lambda val, _pos: f"{val/1e6:.3g} MHz" if abs(val)>=1e6 else f"{val:.3g} Hz"))
+        state["secax"] = secax
+        fig.canvas.draw_idle()
 
-    plt.tight_layout()
+    # ---------- Main update pipeline ----------
+    def update_all(_=None):
+        # Clamp cutoffs: low <= high
+        low = sl_low.val
+        high = sl_high.val
+        if high < low + 1e-9:
+            high = min(low + 1e-6, state["nyq_cmm"])
+            sl_high.set_val(high)
+
+        state["bg_mm"] = sl_bg.val
+        state["low_cmm"] = low
+        state["high_cmm"] = high
+
+        disp, f2d, extent = update_filters()
+        state["extent"] = extent
+
+        # --- Image panel
+        ax_img.clear()
+        ax_img.imshow(disp, cmap="gray", interpolation="nearest")
+        ax_img.set_title("Filtered image (bg removed + band-pass)")
+        ax_img.set_axis_off()
+
+        # If a line exists, draw it
+        if state["line_pts"] is not None:
+            (x0, y0), (x1, y1) = state["line_pts"]
+            ax_img.plot([x0, x1], [y0, y1], "-r", lw=2)
+            ax_img.scatter([x0, x1], [y0, y1], c="yellow", s=40)
+
+        # --- 2D FFT panel
+        ax_fft2.clear()
+        im = ax_fft2.imshow(f2d, cmap="gray", extent=extent, origin="lower", aspect="auto")
+        ax_fft2.set_title("2D FFT magnitude (log) of filtered image")
+        ax_fft2.set_xlabel("fx (cycles/mm)")
+        ax_fft2.set_ylabel("fy (cycles/mm)")
+        cbar = plt.colorbar(im, ax=ax_fft2, fraction=0.046, pad=0.04)
+        cbar.set_label("Norm. log magnitude")
+
+        # --- Profiles + Spectrum
+        p0, p1disp = current_profiles(disp)
+        ax_prof.clear()
+        ax_prof.set_title("Line intensity profile")
+        ax_prof.set_xlabel("Distance along line (pixels)")
+        ax_prof.set_ylabel("Intensity")
+        if p0 is not None:
+            x_pix = np.linspace(0, 1, len(p0)) * len(p0)
+            ax_prof.plot(x_pix, p0, lw=1.0, label="Original")
+        if p1disp is not None:
+            x_pix = np.linspace(0, 1, len(p1disp)) * len(p1disp)
+            ax_prof.plot(x_pix, p1disp, lw=1.4, label="Filtered (img)")
+        ax_prof.grid(True, alpha=0.25)
+        ax_prof.legend(loc="best")
+
+        # Spectrum (from *filtered* profile for stability)
+        ax_spec.clear()
+        ax_spec.set_title("1D FFT along line")
+        ax_spec.set_xlabel("Spatial frequency (cycles/mm)")
+        ax_spec.set_ylabel("Magnitude")
+        ax_spec.grid(True, alpha=0.3)
+        ax_spec.set_xlim(0, state["nyq_cmm"])
+
+        if p0 is not None:
+            # Original spectrum (faint)
+            fp_o, mag_o, *_ = compute_spectrum(p0, 0.0, state["nyq_cmm"])
+            ax_spec.plot(fp_o, mag_o, lw=0.9, label="Original (BP 0..Nyq)")
+
+        if p1disp is not None:
+            fp_f, mag_f, fpk_cmm, lam_d, lam_i, f_d, f_i = compute_spectrum(p1disp, state["low_cmm"], state["high_cmm"])
+            ax_spec.plot(fp_f, mag_f, lw=1.6, label="Filtered (profile BP)")
+            if np.isfinite(fpk_cmm) and fpk_cmm > 0:
+                ax_spec.axvline(fpk_cmm, ls="--", lw=1)
+                txt = f"peak ≈ {fpk_cmm:.3g} c/mm | λ={lam_d:.3g} mm (direct), {lam_i:.3g} mm (intensity)"
+                ax_spec.text(fpk_cmm, max(mag_f)*0.9, txt, rotation=90, va="top", ha="right", fontsize=9)
+
+            # Figure title summary
+            if state["use_speed"] and state["v_mps"]:
+                if state["intensity_case"] and f_i:
+                    ftxt = f"{f_i/1e6:.3g} MHz (intensity)"
+                elif (not state["intensity_case"]) and f_d:
+                    ftxt = f"{f_d/1e6:.3g} MHz (field)"
+                else:
+                    ftxt = "n/a"
+            else:
+                ftxt = "—"
+            fig.suptitle(
+                f"Calibration: {um_per_px:.4g} µm/px | Filters: BG={state['bg_mm']:.3g} mm, "
+                f"BP=[{state['low_cmm']:.3g}, {state['high_cmm']:.3g}] c/mm | "
+                f"Peak: {fpk_cmm:.3g} c/mm | "
+                f"λ_field≈{lam_i:.3g} mm | f≈{ftxt}",
+                fontsize=11
+            )
+
+        # Secondary (top) axis in Hz
+        set_top_axis(ax_spec, state["use_speed"], state["intensity_case"])
+
+        ax_img.figure.canvas.draw_idle()
+
+    # ---------- Event wiring ----------
+    def on_slider_change(val):
+        update_all()
+
+    sl_bg.on_changed(on_slider_change)
+    sl_low.on_changed(on_slider_change)
+    sl_high.on_changed(on_slider_change)
+
+    def on_reselect_clicked(_event):
+        # Enable click-to-select on the image axes
+        state["selecting_line"] = True
+        state["line_pts"] = None
+        ax_img.set_title("Click TWO points to define the analysis line (same area)")
+        fig.canvas.draw_idle()
+
+    btn_reselect.on_clicked(on_reselect_clicked)
+
+    def on_check_clicked(label):
+        if label == "Intensity ÷2":
+            state["intensity_case"] = not state["intensity_case"]
+        elif label == "Show Hz axis":
+            state["use_speed"] = not state["use_speed"]
+        update_all()
+
+    chk.on_clicked(on_check_clicked)
+
+    def on_speed_submit(text):
+        try:
+            v = float(text)
+            state["v_mps"] = v if v > 0 else None
+        except ValueError:
+            state["v_mps"] = None
+        update_all()
+
+    txt.on_submit(on_speed_submit)
+
+    # Mouse clicks for line reselection
+    click_buffer = []
+    def on_mouse_click(event):
+        if not state["selecting_line"]:
+            return
+        if event.inaxes != ax_img:
+            return
+        if event.xdata is None or event.ydata is None:
+            return
+        click_buffer.append((event.xdata, event.ydata))
+        # Draw temporary markers
+        ax_img.scatter([event.xdata], [event.ydata], c="cyan", s=40)
+        fig.canvas.draw_idle()
+        if len(click_buffer) >= 2:
+            state["line_pts"] = (click_buffer[0], click_buffer[1])
+            click_buffer.clear()
+            state["selecting_line"] = False
+            # fall through to update_all which will draw the line and recompute
+            update_all()
+
+    cid_click = fig.canvas.mpl_connect('button_press_event', on_mouse_click)
+
+    # First run: compute filters and prompt for initial line
+    update_all()
+    ensure_line()
+    update_all()
+
     plt.show()
-
-    # ---- Console summary ----
-    print("\n=== Calibration ===")
-    print(f"Pixel distance: {pixel_distance:.6g} px")
-    print(f"Known distance: {known_mm:.6g} mm")
-    print(f"Pixel size: {um_per_px:.6g} µm/px  ({mm_per_px:.6g} mm/px)")
-
-    print("\n=== Cleanup parameters ===")
-    print(f"Background radius: {bg_radius_mm if bg_radius_mm is not None else 0:.6g} mm  "
-          f"(sigma ≈ {(bg_radius_mm/mm_per_px) if (bg_radius_mm and mm_per_px) else 0:.3g} px)")
-    print(f"Band-pass: low={low_cmm:.6g} c/mm, high={high_cmm:.6g} c/mm  (Nyquist ≈ {nyq_cmm:.6g} c/mm)")
-
-    print("\n=== Analysis results (from filtered profile) ===")
-    print(f"Dominant spatial peak: {fpk_cmm:.6g} cycles/mm")
-    print(f"λ_direct (1/peak): {lambda_direct_mm:.6g} mm")
-    print(f"λ_field (intensity case, 2/peak): {lambda_intensity_mm:.6g} mm")
-    if v_mps:
-        if f_direct_Hz:
-            print(f"Estimated f_direct: {f_direct_Hz/1e6:.6g} MHz")
-        if f_intensity_Hz:
-            print(f"Estimated f_intensity (standing-wave): {f_intensity_Hz/1e6:.6g} MHz")
 
 if __name__ == "__main__":
     main()
