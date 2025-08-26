@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 """
-Interactive line-spectrum analyzer with real-time filtered image preview.
+Interactive line-spectrum analyzer with SAME-SIZE panels (image & graph)
+- Left:  filtered image (live preview, original aspect ratio preserved)
+- Right: 1D FFT along the selected line (panel sized to match the image)
 
-Left:  filtered image (updates live as you adjust filters)
-Right: 1D FFT (cycles/mm) along the selected line
+Defaults:
+- Wave speed = 1497 m/s (water @ ~25 °C)
+- Standing-wave INTENSITY interpretation enabled ("Intensity ÷2")
 
 Controls (right panel):
-  • BG radius (mm)      — local-mean subtraction (Gaussian)
-  • Band-pass low/high  — cycles/mm kept in both 2D (image) + 1D (profile)
-  • Speed m/s           — default 1497 (water @ 25°C)
-  • Toggles: "Intensity ÷2" (standing-wave intensity), "Show Hz axis"
-  • Button: "Reselect line" — click TWO points in the image pane
-
-Requirements:
-    pip install numpy matplotlib scikit-image
+  • BG radius (mm)
+  • Band-pass Low/High (cycles/mm)
+  • Speed m/s (editable)
+  • Toggles: "Intensity ÷2", "Show Hz axis"
+  • Button: "Reselect line" (click two points on the image)
 """
 
 import numpy as np
@@ -154,6 +154,9 @@ def main():
     px_m = mm_per_px * 1e-3
     nyq_cmm = 1.0 / (2.0 * mm_per_px)
 
+    # Image aspect ratio (height / width) for box sizing
+    img_box_aspect = gray0.shape[0] / gray0.shape[1]
+
     # ---- Initial state ----
     state = {
         "gray0": gray0,
@@ -172,23 +175,36 @@ def main():
         "metrics_text": None,
         "selecting_line": True,  # start by selecting a line
         "hint_text": None,
+        "img_box_aspect": img_box_aspect,
     }
 
     # ---- Build layout: [image | spectrum | right control panel] ----
     plt.close("all")
     fig = plt.figure(figsize=(15, 8.8))
     gs = fig.add_gridspec(
-        nrows=1, ncols=3, width_ratios=[1.1, 1.3, 0.9],
+        nrows=1, ncols=3, width_ratios=[1, 1, 0.9],   # <-- equal widths for left & middle
         left=0.05, right=0.98, top=0.93, bottom=0.09, wspace=0.25
     )
     ax_img   = fig.add_subplot(gs[0, 0])
     ax_spec  = fig.add_subplot(gs[0, 1])
     ax_panel = fig.add_subplot(gs[0, 2]); ax_panel.axis("off")
 
+    # Make BOTH left & middle panels the SAME box size & match the image aspect
+    def apply_box_aspect():
+        try:
+            ax_img.set_box_aspect(state["img_box_aspect"])
+            ax_spec.set_box_aspect(state["img_box_aspect"])
+        except Exception:
+            # set_box_aspect requires Matplotlib >= 3.3; if unavailable, we still preserve image aspect via imshow
+            pass
+
+    apply_box_aspect()
+
     # Small hint overlay in the image panel
     state["hint_text"] = ax_img.text(0.02, 0.98, "Click TWO points to set the line",
                                      transform=ax_img.transAxes, va="top", ha="left",
-                                     fontsize=9, color="tab:blue", bbox=dict(facecolor='white', alpha=0.6, edgecolor='none'))
+                                     fontsize=9, color="tab:blue",
+                                     bbox=dict(facecolor='white', alpha=0.6, edgecolor='none'))
 
     # Control panel stacking helper
     panel_pos = ax_panel.get_position()
@@ -319,9 +335,12 @@ def main():
         # Recompute filtered image
         disp, _ = compute_filtered_image()
 
-        # Image preview (real-time)
+        # Re-apply same-size panel boxes every draw
+        apply_box_aspect()
+
+        # Image preview (real-time), preserve original aspect
         ax_img.clear()
-        ax_img.imshow(disp, cmap="gray", interpolation="nearest")
+        ax_img.imshow(disp, cmap="gray", interpolation="nearest", aspect="equal")
         ax_img.set_title("Filtered image (live)")
         ax_img.set_axis_off()
         if state["line_pts"] is not None:
@@ -330,7 +349,7 @@ def main():
             ax_img.scatter([x0, x1], [y0, y1], c="yellow", s=40)
         state["hint_text"].set_visible(state["selecting_line"])
 
-        # 1D spectrum
+        # 1D spectrum panel (same box size as image)
         ax_spec.clear()
         ax_spec.set_title("1D FFT along selected line")
         ax_spec.set_xlabel("Spatial frequency (cycles/mm)")
@@ -384,17 +403,14 @@ def main():
     sl_high.on_changed(update_all)
 
     # Line (re)selection inside the same window
-    def on_reselect(_event):
-        state["selecting_line"] = True
-        state["line_pts"] = None
-        update_all()
-    btn_line.on_clicked(on_reselect)
+    btn_line.on_clicked(lambda _e: start_line_selection())
 
     click_buffer = []
     def on_mouse_click(event):
-        if not state["selecting_line"]: return
-        if event.inaxes != ax_img: return
-        if event.xdata is None or event.ydata is None: return
+        if not state["selecting_line"]:
+            return
+        if event.inaxes != ax_img or event.xdata is None or event.ydata is None:
+            return
         click_buffer.append((event.xdata, event.ydata))
         ax_img.scatter([event.xdata], [event.ydata], c="cyan", s=40)
         fig.canvas.draw_idle()
@@ -404,6 +420,11 @@ def main():
             state["selecting_line"] = False
             update_all()
     fig.canvas.mpl_connect('button_press_event', on_mouse_click)
+
+    def start_line_selection():
+        state["selecting_line"] = True
+        state["line_pts"] = None
+        update_all()
 
     # ---- First draw ----
     update_all()
