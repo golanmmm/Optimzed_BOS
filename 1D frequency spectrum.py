@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """
-Interactive line-spectrum analyzer (top/bottom layout, fixed)
+Interactive line-spectrum analyzer (top/bottom layout, near/far-field support)
 
 Left column:
-  • Top  : filtered image (keeps original aspect ratio)
+  • Top   : filtered image (keeps original aspect ratio)
   • Bottom: 1D FFT along selected line
 
 Right panel:
   • BG radius (mm), Low/High (c/mm) sliders
   • Speed m/s (default 1497, water @ 25 °C)
   • Toggles: "Intensity ÷2", "Show Hz axis"
-  • Buttons: "Reselect line", "Show equations"
-  • Live metrics
+  • Buttons: "Reselect line", "Measure diameter", "Show equations"
+  • Live metrics incl. λ_from f_intensity, diameter D, near-field N
 
 Requirements:
     pip install numpy matplotlib scikit-image
@@ -171,27 +171,28 @@ def main():
         "use_speed": True,
         "intensity_case": True,  # standing-wave intensity by default
         "line_pts": None,        # ((x0,y0),(x1,y1))
+        "diam_pts": None,        # ((x0,y0),(x1,y1)) for transducer diameter
+        "D_mm": None,            # measured diameter
         "secax": None,
         "metrics_text": None,
-        "selecting_line": True,
+        "selecting_line": False,
+        "selecting_diam": False,
         "hint_text": None,
     }
 
     # ---- Build layout: [IMAGE (top) | SPECTRUM (bottom)] + right control panel ----
     plt.close("all")
 
-    # Layout tuned to give more real estate to the TOP image
     LEFT, RIGHT, TOP, BOTTOM = 0.055, 0.975, 0.95, 0.07
     WIDTH_RATIOS = [1.8, 0.7]      # wider left column, slimmer right panel
-    TOP_SCALE = 3.0                # ↑ makes top image taller relative to graph (≈65% top / 35% bottom)
+    TOP_SCALE = 3.0                # ↑ makes top image taller vs bottom graph
     HEIGHT_RATIOS = [TOP_SCALE * img_box_aspect, 1.0]
     WSPACE = 0.12
     HSPACE = 0.12
     FIG_W = 15.0
 
-    # Choose a figure height so the top image can respect its aspect AND fill space
     _sumw = sum(WIDTH_RATIOS)
-    _wfrac_left = (RIGHT - LEFT) * (WIDTH_RATIOS[0] / _sumw)  # fraction of fig width for left column
+    _wfrac_left = (RIGHT - LEFT) * (WIDTH_RATIOS[0] / _sumw)
     _hfrac = (TOP - BOTTOM)
     FIG_H = max(7.0, (FIG_W * _wfrac_left * (TOP_SCALE * img_box_aspect + 1.0)) / max(_hfrac, 1e-6))
 
@@ -206,7 +207,6 @@ def main():
     ax_spec  = fig.add_subplot(gs[1, 0])      # BOTTOM: 1D FFT along line
     ax_panel = fig.add_subplot(gs[:, 1]); ax_panel.axis("off")
 
-    # Make the top image preserve original aspect and expand
     def apply_box_aspect():
         try:
             ax_img.set_box_aspect(img_box_aspect)
@@ -216,7 +216,7 @@ def main():
 
     # Hint overlay on the image
     state["hint_text"] = ax_img.text(
-        0.02, 0.98, "Click TWO points to set the line",
+        0.02, 0.98, "",
         transform=ax_img.transAxes, va="top", ha="left",
         fontsize=9, color="tab:blue",
         bbox=dict(facecolor='white', alpha=0.6, edgecolor='none')
@@ -258,10 +258,13 @@ def main():
     btn_line_ax = add_box(h=0.06)
     btn_line = Button(btn_line_ax, "Reselect line")
 
+    btn_diam_ax = add_box(h=0.06)
+    btn_diam = Button(btn_diam_ax, "Measure diameter")
+
     btn_eq_ax = add_box(h=0.06)
     btn_eq = Button(btn_eq_ax, "Show equations")
 
-    # ---- Equations popup (kept out of the control panel to avoid overlap) ----
+    # ---- Equations popup ----
     def show_equations(_event=None):
         eq = [
             "Calibration:",
@@ -284,22 +287,27 @@ def main():
             "Line profile & 1D FFT:",
             "  p[n] = profile(I_bp along chosen line)",
             "  P[k] = FFT( (p - mean(p)) * hann )",
-            "  nu_px[k] = k/N  (cycles/pixel)",
-            "  nu_mm = nu_px / mm_per_px",
+            "  nu_px[k] = k/N  (cycles/pixel);  nu_mm = nu_px / mm_per_px",
             "  nu_peak = argmax_{k>0} |P[k]|",
             "",
             "Wavelengths:",
             "  lambda_field_mm     = 1 / nu_peak",
             "  lambda_intensity_mm = 2 / nu_peak   (since I ~ cos^2)",
+            "  (also lambda_from_f_int_mm = v / f_intensity * 1e3)",
             "",
             "Temporal frequency (speed v in m/s):",
-            "  f_field     = v / (lambda_field_mm * 1e-3)     = v * (nu_peak * 1000)",
-            "  f_intensity = v / (lambda_intensity_mm * 1e-3) = v * (nu_peak * 1000) / 2",
+            "  f_field     = v * (nu_peak * 1000)",
+            "  f_intensity = v * (nu_peak * 1000) / 2",
+            "",
+            "Near/Far field for a circular piston (unfocused):",
+            "  Given diameter D (mm) measured on image:",
+            "  N_mm ≈ D_mm^2 / (4 * lambda_field_mm)",
+            "  (far field begins for z ≳ N_mm)",
         ]
         fig2 = plt.figure(figsize=(8, 6))
-        ax2 = fig2.add_subplot(111)
-        ax2.axis("off")
-        ax2.text(0.02, 0.98, "\n".join(eq), va="top", ha="left", family="monospace", fontsize=10)
+        ax2 = fig2.add_subplot(111); ax2.axis("off")
+        ax2.text(0.02, 0.98, "\n".join(eq), va="top", ha="left",
+                 family="monospace", fontsize=10)
         fig2.suptitle("Equations used", fontsize=12)
         fig2.tight_layout()
         fig2.show()
@@ -329,26 +337,24 @@ def main():
         else:
             idx = 0
         fpk = max(fcmm[idx], 0.0)
-        lam_d = (1.0 / fpk) if fpk > 0 else np.inf
-        lam_i = (2.0 / fpk) if fpk > 0 else np.inf
+        lam_direct = (1.0 / fpk) if fpk > 0 else np.inf
+        lam_int = (2.0 / fpk) if fpk > 0 else np.inf
 
-        f_field = f_int = None
         v = state["v_mps"] if state["use_speed"] else None
-        if v and np.isfinite(lam_d):
-            lam_d_m = lam_d * 1e-3; lam_i_m = lam_i * 1e-3
+        f_field = f_int = None
+        if v and np.isfinite(lam_direct):
+            lam_d_m = lam_direct * 1e-3; lam_i_m = lam_int * 1e-3
             f_field = v / lam_d_m if lam_d_m > 0 else None
             f_int   = v / lam_i_m if lam_i_m > 0 else None
-        return fcmm, mag, fpk, lam_d, lam_i, f_field, f_int
+        return fcmm, mag, fpk, lam_direct, lam_int, f_field, f_int
 
     def set_top_axis():
         if state["secax"] is not None:
             try: state["secax"].remove()
             except Exception: pass
             state["secax"] = None
-
         if not state["use_speed"] or (state["v_mps"] is None) or state["v_mps"] <= 0:
             fig.canvas.draw_idle(); return
-
         v = state["v_mps"]
         if state["intensity_case"]:
             def cmm_to_Hz(x): return v * (x * 1000.0) / 2.0
@@ -358,7 +364,6 @@ def main():
             def cmm_to_Hz(x): return v * (x * 1000.0)
             def Hz_to_cmm(x): return x / (v * 1000.0)
             label = "Temporal frequency (Hz) — FIELD"
-
         sec = ax_spec.secondary_xaxis('top', functions=(cmm_to_Hz, Hz_to_cmm))
         sec.set_xlabel(label)
         sec.xaxis.set_major_formatter(mticker.FuncFormatter(
@@ -367,16 +372,32 @@ def main():
         state["secax"] = sec
         fig.canvas.draw_idle()
 
-    def update_metrics(fpk, lam_d, lam_i, f_field, f_int):
+    def near_field_length(D_mm, lambda_field_mm):
+        if (D_mm is None) or (lambda_field_mm is None) or not np.isfinite(lambda_field_mm) or lambda_field_mm <= 0:
+            return None
+        return (D_mm ** 2) / (4.0 * lambda_field_mm)
+
+    def update_metrics(fpk, lam_direct, lam_int, f_field, f_int):
+        # Wavelength from f_int (explicit)
+        lam_from_fint_mm = None
+        if f_int is not None and f_int > 0:
+            lam_from_fint_mm = (state["v_mps"] / f_int) * 1e3  # mm
+
+        # Diameter & near field (use field wavelength = lam_int)
+        N_mm = near_field_length(state["D_mm"], lam_int if np.isfinite(lam_int) else None)
+
         lines = [
             f"Pixel size   : {state['um_per_px']:.4g} µm/px",
             f"Nyquist      : {state['nyq_cmm']:.4g} c/mm",
             f"Peak (c/mm)  : {fpk:.4g}",
-            f"λ_direct     : {lam_d:.4g} mm",
-            f"λ_intensity  : {lam_i:.4g} mm",
+            f"λ_direct     : {lam_direct:.4g} mm",
+            f"λ_intensity  : {lam_int:.4g} mm",
+            f"λ_from f_int : {lam_from_fint_mm:.4g} mm" if lam_from_fint_mm else "λ_from f_int : —",
             f"Speed (m/s)  : {state['v_mps']:.4g} {'[ON]' if state['use_speed'] else '[OFF]'}",
             f"f_field      : {f_field/1e6:.4g} MHz" if f_field is not None else "f_field      : —",
             f"f_intensity  : {f_int/1e6:.4g} MHz" if f_int is not None else "f_intensity  : —",
+            f"D (diameter) : {state['D_mm']:.4g} mm" if state["D_mm"] else "D (diameter) : —",
+            f"N (near fld) : {N_mm:.4g} mm" if N_mm else "N (near fld) : —",
         ]
         state["metrics_text"].set_text("\n".join(lines))
 
@@ -392,22 +413,37 @@ def main():
         state["low_cmm"] = low
         state["high_cmm"] = high
 
-        # Recompute filtered image
         disp, _ = compute_filtered_image()
-
-        # Re-apply aspect for the top image axes every draw
-        apply_box_aspect()
 
         # Image (top)
         ax_img.clear()
+        try:
+            ax_img.set_box_aspect(img_box_aspect)
+        except Exception:
+            pass
         ax_img.imshow(disp, cmap="gray", interpolation="nearest", aspect="equal")
         ax_img.set_title("Filtered image (live)")
         ax_img.set_axis_off()
+
+        # line overlay
         if state["line_pts"] is not None:
             (x0, y0), (x1, y1) = state["line_pts"]
             ax_img.plot([x0, x1], [y0, y1], "-r", lw=2)
             ax_img.scatter([x0, x1], [y0, y1], c="yellow", s=40)
-        state["hint_text"].set_visible(state["selecting_line"])
+        # diameter overlay
+        if state["diam_pts"] is not None:
+            (dx0, dy0), (dx1, dy1) = state["diam_pts"]
+            ax_img.plot([dx0, dx1], [dy0, dy1], "-g", lw=2)
+            ax_img.scatter([dx0, dx1], [dy0, dy1], c="lime", s=40)
+
+        # hint
+        hint_txt = ""
+        if state["selecting_line"]:
+            hint_txt = "Click TWO points to set the LINE"
+        elif state["selecting_diam"]:
+            hint_txt = "Click TWO points to measure DIAMETER"
+        state["hint_text"].set_text(hint_txt)
+        state["hint_text"].set_visible(bool(hint_txt))
 
         # Spectrum (bottom)
         ax_spec.clear()
@@ -417,22 +453,22 @@ def main():
         ax_spec.set_xlim(0, state["nyq_cmm"])
         ax_spec.grid(True, alpha=0.3)
 
-        fpk = 0.0; lam_d = np.inf; lam_i = np.inf; f_field = None; f_int = None
+        fpk = 0.0; lam_direct = np.inf; lam_int = np.inf; f_field = None; f_int = None
         out = spectrum_from_line(disp)
         if out is not None:
-            fc, mag, fpk, lam_d, lam_i, f_field, f_int = out
+            fc, mag, fpk, lam_direct, lam_int, f_field, f_int = out
             ax_spec.plot(fc, mag, lw=1.8)
             if np.isfinite(fpk) and fpk > 0:
                 ax_spec.axvline(fpk, ls="--", lw=1)
                 ax_spec.text(fpk, max(mag)*0.9,
-                             f"peak ≈ {fpk:.3g} c/mm\nλ={lam_d:.3g} mm (direct)\nλ={lam_i:.3g} mm (int)",
+                             f"peak ≈ {fpk:.3g} c/mm\nλ={lam_direct:.3g} mm (direct)\nλ={lam_int:.3g} mm (int)",
                              rotation=90, va="top", ha="right", fontsize=9)
 
         # Secondary axis in Hz
         set_top_axis()
 
         # Metrics + window title
-        update_metrics(fpk, lam_d, lam_i, f_field, f_int)
+        update_metrics(fpk, lam_direct, lam_int, f_field, f_int)
         fig.suptitle(
             f"BG={state['bg_mm']:.3g} mm | BP=[{state['low_cmm']:.3g}, {state['high_cmm']:.3g}] c/mm | "
             f"Speed default: 1497 m/s (water @ 25°C)",
@@ -462,33 +498,59 @@ def main():
     sl_low.on_changed(update_all)
     sl_high.on_changed(update_all)
 
-    # Line (re)selection inside the same window
+    # Selection modes
     def start_line_selection():
         state["selecting_line"] = True
+        state["selecting_diam"] = False
         state["line_pts"] = None
         update_all()
-    btn_line.on_clicked(lambda _e: start_line_selection())
 
-    # Equations popup
+    def start_diam_selection():
+        state["selecting_diam"] = True
+        state["selecting_line"] = False
+        state["diam_pts"] = None
+        state["D_mm"] = None
+        update_all()
+
+    btn_line.on_clicked(lambda _e: start_line_selection())
+    btn_diam.on_clicked(lambda _e: start_diam_selection())
     btn_eq.on_clicked(show_equations)
 
     click_buffer = []
     def on_mouse_click(event):
-        if not state["selecting_line"]:
-            return
         if event.inaxes != ax_img or event.xdata is None or event.ydata is None:
             return
-        click_buffer.append((event.xdata, event.ydata))
-        ax_img.scatter([event.xdata], [event.ydata], c="cyan", s=40)
-        fig.canvas.draw_idle()
-        if len(click_buffer) >= 2:
-            state["line_pts"] = (click_buffer[0], click_buffer[1])
-            click_buffer.clear()
-            state["selecting_line"] = False
-            update_all()
+        # LINE selection
+        if state["selecting_line"]:
+            click_buffer.append((event.xdata, event.ydata))
+            ax_img.scatter([event.xdata], [event.ydata], c="cyan", s=40)
+            fig.canvas.draw_idle()
+            if len(click_buffer) >= 2:
+                state["line_pts"] = (click_buffer[0], click_buffer[1])
+                click_buffer.clear()
+                state["selecting_line"] = False
+                update_all()
+        # DIAMETER selection
+        elif state["selecting_diam"]:
+            click_buffer.append((event.xdata, event.ydata))
+            ax_img.scatter([event.xdata], [event.ydata], c="lime", s=40)
+            fig.canvas.draw_idle()
+            if len(click_buffer) >= 2:
+                p0, p1 = click_buffer[0], click_buffer[1]
+                state["diam_pts"] = (p0, p1)
+                click_buffer.clear()
+                state["selecting_diam"] = False
+                # compute D in mm
+                dx = p1[0] - p0[0]; dy = p1[1] - p0[1]
+                d_px = float(np.hypot(dx, dy))
+                state["D_mm"] = d_px * state["mm_per_px"]
+                update_all()
+
     fig.canvas.mpl_connect('button_press_event', on_mouse_click)
 
     # ---- First draw ----
+    # Ask for a line once so spectrum isn't empty
+    start_line_selection()
     update_all()
     plt.show()
 
