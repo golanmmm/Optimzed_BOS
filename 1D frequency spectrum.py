@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
 """
-Interactive line-spectrum analyzer with SAME-SIZE panels (image & graph)
-- Left:  filtered image (live preview, original aspect ratio preserved)
-- Right: 1D FFT along the selected line (panel sized to match the image)
+Interactive line-spectrum analyzer (top/bottom layout, fixed)
 
-Defaults:
-- Wave speed = 1497 m/s (water @ ~25 °C)
-- Standing-wave INTENSITY interpretation enabled ("Intensity ÷2")
+Left column:
+  • Top  : filtered image (keeps original aspect ratio)
+  • Bottom: 1D FFT along selected line
 
-Controls (right panel):
-  • BG radius (mm)
-  • Band-pass Low/High (cycles/mm)
-  • Speed m/s (editable)
+Right panel:
+  • BG radius (mm), Low/High (c/mm) sliders
+  • Speed m/s (default 1497, water @ 25 °C)
   • Toggles: "Intensity ÷2", "Show Hz axis"
-  • Button: "Reselect line" (click two points on the image)
+  • Buttons: "Reselect line", "Show equations"
+  • Live metrics
+
+Requirements:
+    pip install numpy matplotlib scikit-image
 """
 
 import numpy as np
@@ -24,6 +25,7 @@ from tkinter import Tk, filedialog, simpledialog
 from skimage import io, color
 from skimage.filters import gaussian
 from skimage.measure import profile_line
+
 
 # -------------------- Tiny tkinter helpers --------------------
 def ask_float(title, prompt, initial=None, minvalue=None):
@@ -43,6 +45,7 @@ def pick_file():
     if not path:
         raise SystemExit("No file selected.")
     return path
+
 
 # -------------------- Image & DSP helpers --------------------
 def to_grayscale_float(img):
@@ -88,10 +91,8 @@ def bandpass_2d_fft(image, mm_per_px, low_cmm=None, high_cmm=None):
     F = np.fft.fft2(image)
     Fsh = np.fft.fftshift(F)
     mask = np.ones_like(R_cpx, dtype=bool)
-    if low_cpx > 0:
-        mask &= (R_cpx >= low_cpx)
-    if high_cpx is not None:
-        mask &= (R_cpx <= high_cpx)
+    if low_cpx > 0:      mask &= (R_cpx >= low_cpx)
+    if high_cpx is not None: mask &= (R_cpx <= high_cpx)
     Ff = Fsh * mask
     return np.fft.ifft2(np.fft.ifftshift(Ff)).real
 
@@ -118,13 +119,12 @@ def bandpass_1d_fft(profile, mm_per_px, low_cmm=None, high_cmm=None):
     high_cpx = cmm_to_cpx(high_cmm) if (high_cmm is not None and high_cmm > 0) else None
 
     mask = np.ones_like(freqs_px, dtype=bool)
-    if low_cpx > 0:
-        mask &= (np.abs(freqs_px) >= low_cpx)
-    if high_cpx is not None:
-        mask &= (np.abs(freqs_px) <= high_cpx)
+    if low_cpx > 0:      mask &= (np.abs(freqs_px) >= low_cpx)
+    if high_cpx is not None: mask &= (np.abs(freqs_px) <= high_cpx)
 
     spec_f = spec * mask
     return np.fft.ifft(spec_f).real
+
 
 # -------------------- App --------------------
 def main():
@@ -154,7 +154,7 @@ def main():
     px_m = mm_per_px * 1e-3
     nyq_cmm = 1.0 / (2.0 * mm_per_px)
 
-    # Image aspect ratio (height / width) for box sizing
+    # Image aspect ratio (height/width)
     img_box_aspect = gray0.shape[0] / gray0.shape[1]
 
     # ---- Initial state ----
@@ -167,46 +167,62 @@ def main():
         "bg_mm": 0.2,
         "low_cmm": 0.0,
         "high_cmm": nyq_cmm,
-        "v_mps": 1497.0,     # default: speed of sound in water @ ~25°C
+        "v_mps": 1497.0,     # water @ ~25 °C
         "use_speed": True,
         "intensity_case": True,  # standing-wave intensity by default
-        "line_pts": None,        # ( (x0,y0), (x1,y1) )
+        "line_pts": None,        # ((x0,y0),(x1,y1))
         "secax": None,
         "metrics_text": None,
-        "selecting_line": True,  # start by selecting a line
+        "selecting_line": True,
         "hint_text": None,
-        "img_box_aspect": img_box_aspect,
     }
 
-    # ---- Build layout: [image | spectrum | right control panel] ----
+    # ---- Build layout: [IMAGE (top) | SPECTRUM (bottom)] + right control panel ----
     plt.close("all")
-    fig = plt.figure(figsize=(15, 8.8))
-    gs = fig.add_gridspec(
-        nrows=1, ncols=3, width_ratios=[1, 1, 0.9],   # <-- equal widths for left & middle
-        left=0.05, right=0.98, top=0.93, bottom=0.09, wspace=0.25
-    )
-    ax_img   = fig.add_subplot(gs[0, 0])
-    ax_spec  = fig.add_subplot(gs[0, 1])
-    ax_panel = fig.add_subplot(gs[0, 2]); ax_panel.axis("off")
 
-    # Make BOTH left & middle panels the SAME box size & match the image aspect
+    # Layout tuned to give more real estate to the TOP image
+    LEFT, RIGHT, TOP, BOTTOM = 0.055, 0.975, 0.95, 0.07
+    WIDTH_RATIOS = [1.8, 0.7]      # wider left column, slimmer right panel
+    TOP_SCALE = 3.0                # ↑ makes top image taller relative to graph (≈65% top / 35% bottom)
+    HEIGHT_RATIOS = [TOP_SCALE * img_box_aspect, 1.0]
+    WSPACE = 0.12
+    HSPACE = 0.12
+    FIG_W = 15.0
+
+    # Choose a figure height so the top image can respect its aspect AND fill space
+    _sumw = sum(WIDTH_RATIOS)
+    _wfrac_left = (RIGHT - LEFT) * (WIDTH_RATIOS[0] / _sumw)  # fraction of fig width for left column
+    _hfrac = (TOP - BOTTOM)
+    FIG_H = max(7.0, (FIG_W * _wfrac_left * (TOP_SCALE * img_box_aspect + 1.0)) / max(_hfrac, 1e-6))
+
+    fig = plt.figure(figsize=(FIG_W, FIG_H))
+    gs = fig.add_gridspec(
+        nrows=2, ncols=2,
+        width_ratios=WIDTH_RATIOS, height_ratios=HEIGHT_RATIOS,
+        left=LEFT, right=RIGHT, top=TOP, bottom=BOTTOM,
+        wspace=WSPACE, hspace=HSPACE
+    )
+    ax_img   = fig.add_subplot(gs[0, 0])      # TOP: filtered image
+    ax_spec  = fig.add_subplot(gs[1, 0])      # BOTTOM: 1D FFT along line
+    ax_panel = fig.add_subplot(gs[:, 1]); ax_panel.axis("off")
+
+    # Make the top image preserve original aspect and expand
     def apply_box_aspect():
         try:
-            ax_img.set_box_aspect(state["img_box_aspect"])
-            ax_spec.set_box_aspect(state["img_box_aspect"])
+            ax_img.set_box_aspect(img_box_aspect)
         except Exception:
-            # set_box_aspect requires Matplotlib >= 3.3; if unavailable, we still preserve image aspect via imshow
             pass
-
     apply_box_aspect()
 
-    # Small hint overlay in the image panel
-    state["hint_text"] = ax_img.text(0.02, 0.98, "Click TWO points to set the line",
-                                     transform=ax_img.transAxes, va="top", ha="left",
-                                     fontsize=9, color="tab:blue",
-                                     bbox=dict(facecolor='white', alpha=0.6, edgecolor='none'))
+    # Hint overlay on the image
+    state["hint_text"] = ax_img.text(
+        0.02, 0.98, "Click TWO points to set the line",
+        transform=ax_img.transAxes, va="top", ha="left",
+        fontsize=9, color="tab:blue",
+        bbox=dict(facecolor='white', alpha=0.6, edgecolor='none')
+    )
 
-    # Control panel stacking helper
+    # --------- Control panel stacking helper ---------
     panel_pos = ax_panel.get_position()
     px, py = panel_pos.x0, panel_pos.y0
     pw, ph = panel_pos.width, panel_pos.height
@@ -220,7 +236,7 @@ def main():
         return ax
 
     # Metrics (monospace text)
-    metrics_ax = fig.add_axes([px + 0.03*pw, panel_pos.y1 - 0.13, 0.94*pw, 0.11])
+    metrics_ax = fig.add_axes([px + 0.03*pw, panel_pos.y1 - 0.12, 0.94*pw, 0.10])
     metrics_ax.axis("off")
     state["metrics_text"] = metrics_ax.text(0, 1, "", va="top", ha="left", fontsize=9, family="monospace")
 
@@ -242,6 +258,54 @@ def main():
     btn_line_ax = add_box(h=0.06)
     btn_line = Button(btn_line_ax, "Reselect line")
 
+    btn_eq_ax = add_box(h=0.06)
+    btn_eq = Button(btn_eq_ax, "Show equations")
+
+    # ---- Equations popup (kept out of the control panel to avoid overlap) ----
+    def show_equations(_event=None):
+        eq = [
+            "Calibration:",
+            "  d_px = sqrt((x2-x1)^2 + (y2-y1)^2)",
+            "  mm_per_px = d_real_mm / d_px;  um_per_px = 1000 * mm_per_px",
+            "  Nyquist (cycles/mm) = 1 / (2 * mm_per_px)",
+            "",
+            "Background removal:",
+            "  sigma_px = radius_mm / mm_per_px",
+            "  I_bg = Gaussian_sigma(I);  I' = I - I_bg",
+            "",
+            "2D band-pass (FFT):",
+            "  F = FFT2(I')",
+            "  r = sqrt(u^2 + v^2)  (u,v in cycles/pixel)",
+            "  low_cpx  = low_cmm  * mm_per_px",
+            "  high_cpx = high_cmm * mm_per_px",
+            "  F_bp = F * 1[ low_cpx <= r <= high_cpx ]",
+            "  I_bp = IFFT2(F_bp)",
+            "",
+            "Line profile & 1D FFT:",
+            "  p[n] = profile(I_bp along chosen line)",
+            "  P[k] = FFT( (p - mean(p)) * hann )",
+            "  nu_px[k] = k/N  (cycles/pixel)",
+            "  nu_mm = nu_px / mm_per_px",
+            "  nu_peak = argmax_{k>0} |P[k]|",
+            "",
+            "Wavelengths:",
+            "  lambda_field_mm     = 1 / nu_peak",
+            "  lambda_intensity_mm = 2 / nu_peak   (since I ~ cos^2)",
+            "",
+            "Temporal frequency (speed v in m/s):",
+            "  f_field     = v / (lambda_field_mm * 1e-3)     = v * (nu_peak * 1000)",
+            "  f_intensity = v / (lambda_intensity_mm * 1e-3) = v * (nu_peak * 1000) / 2",
+        ]
+        fig2 = plt.figure(figsize=(8, 6))
+        ax2 = fig2.add_subplot(111)
+        ax2.axis("off")
+        ax2.text(0.02, 0.98, "\n".join(eq), va="top", ha="left", family="monospace", fontsize=10)
+        fig2.suptitle("Equations used", fontsize=12)
+        fig2.tight_layout()
+        fig2.show()
+
+    btn_eq.on_clicked(show_equations)
+
     # ---- Processing helpers ----
     def compute_filtered_image():
         g0 = state["gray0"]
@@ -253,7 +317,6 @@ def main():
         if state["line_pts"] is None:
             return None
         (x0, y0), (x1, y1) = state["line_pts"]
-        # profile from filtered image display; then extra 1D BP
         prof = profile_line(g_filtered_disp, (y0, x0), (y1, x1),
                             mode="reflect", order=1, linewidth=1, reduce_func=None)
         if getattr(prof, "ndim", 1) > 1:
@@ -278,7 +341,6 @@ def main():
         return fcmm, mag, fpk, lam_d, lam_i, f_field, f_int
 
     def set_top_axis():
-        # Remove existing secondary axis if any
         if state["secax"] is not None:
             try: state["secax"].remove()
             except Exception: pass
@@ -289,12 +351,10 @@ def main():
 
         v = state["v_mps"]
         if state["intensity_case"]:
-            # intensity: f = v*(ν*1000)/2
             def cmm_to_Hz(x): return v * (x * 1000.0) / 2.0
             def Hz_to_cmm(x): return (x * 2.0) / (v * 1000.0)
             label = "Temporal frequency (Hz) — INTENSITY (÷2)"
         else:
-            # field: f = v*(ν*1000)
             def cmm_to_Hz(x): return v * (x * 1000.0)
             def Hz_to_cmm(x): return x / (v * 1000.0)
             label = "Temporal frequency (Hz) — FIELD"
@@ -335,10 +395,10 @@ def main():
         # Recompute filtered image
         disp, _ = compute_filtered_image()
 
-        # Re-apply same-size panel boxes every draw
+        # Re-apply aspect for the top image axes every draw
         apply_box_aspect()
 
-        # Image preview (real-time), preserve original aspect
+        # Image (top)
         ax_img.clear()
         ax_img.imshow(disp, cmap="gray", interpolation="nearest", aspect="equal")
         ax_img.set_title("Filtered image (live)")
@@ -349,7 +409,7 @@ def main():
             ax_img.scatter([x0, x1], [y0, y1], c="yellow", s=40)
         state["hint_text"].set_visible(state["selecting_line"])
 
-        # 1D spectrum panel (same box size as image)
+        # Spectrum (bottom)
         ax_spec.clear()
         ax_spec.set_title("1D FFT along selected line")
         ax_spec.set_xlabel("Spatial frequency (cycles/mm)")
@@ -403,7 +463,14 @@ def main():
     sl_high.on_changed(update_all)
 
     # Line (re)selection inside the same window
+    def start_line_selection():
+        state["selecting_line"] = True
+        state["line_pts"] = None
+        update_all()
     btn_line.on_clicked(lambda _e: start_line_selection())
+
+    # Equations popup
+    btn_eq.on_clicked(show_equations)
 
     click_buffer = []
     def on_mouse_click(event):
@@ -421,14 +488,10 @@ def main():
             update_all()
     fig.canvas.mpl_connect('button_press_event', on_mouse_click)
 
-    def start_line_selection():
-        state["selecting_line"] = True
-        state["line_pts"] = None
-        update_all()
-
     # ---- First draw ----
     update_all()
     plt.show()
+
 
 if __name__ == "__main__":
     main()
