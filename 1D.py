@@ -1,3 +1,27 @@
+#!/usr/bin/env python3
+"""
+Ultrasound GUI — Calibration → Line FFT → THEN Filtering (1D along line or 2D wedge)
+
+Flow (as requested):
+  1) User loads image (UNFILTERED view so clicks are clear)
+  2) User selects 2 points for px/mm calibration
+  3) User selects a line (2 points)
+  4) We compute 1D FFT along that line (c = 1497 m/s for water @25°C by default)
+  5) ONLY AFTER the FFT: apply a frequency‑range filter to the image.
+     You can choose:
+        • "1D line‑by‑line" → rotates image so the selected line is horizontal,
+          band‑passes each row (1‑D FFT along the row), rotates back.
+        • "2D FFT wedge" → prior directional wedge mask in the 2‑D spectrum.
+
+Notes:
+  • Default speed is 1497 m/s (water @25°C). You can change it in Calibration.
+  • Default filter method = 1D line‑by‑line; filtering is DISABLED until the line FFT is done.
+  • Min/Max f [MHz] + Taper% control the passband in both methods.
+
+Requirements:
+    pip install numpy matplotlib scikit-image PyQt5
+"""
+
 from __future__ import annotations
 import sys, os
 import numpy as np
@@ -10,18 +34,19 @@ from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QHBoxLayout, QVBoxLayout, QFormLayout,
     QDoubleSpinBox, QGroupBox, QPushButton, QLabel, QFileDialog, QComboBox,
-    QSlider, QSplitter, QMessageBox, QDialog
+    QSlider, QSplitter, QMessageBox, QDialog, QCheckBox
 )
 from PyQt5.QtWidgets import QInputDialog
 from skimage import io as skio
 from skimage.color import rgb2gray
 from skimage.measure import profile_line
+from skimage.transform import rotate
 
 @dataclass
 class Calibration:
     mm_per_pixel: float = 0.05
-    speed_ms: float = 1497.0
-    standing_wave: bool = True
+    speed_ms: float = 1497.0  # water @25°C
+    standing_wave: bool = True   # True → k=2/λ, False → k=1/λ
 
 class MplCanvas(FigureCanvas):
     def __init__(self):
@@ -101,11 +126,11 @@ class BeamSimDialog(QDialog):
 class UltrasoundFilterGUI(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle('Ultrasound GUI — Filtering + Calibration + FFT + Beam Sim')
-        self.resize(1400, 860)
+        self.setWindowTitle('Ultrasound GUI — Calibrate → Line → FFT → Filter')
+        self.resize(1480, 900)
         self.orig_img: np.ndarray | None = None
         self.fft_cache: np.ndarray | None = None
-        self.freq_grid_cpp: np.ndarray | None = None
+        self._KX = None; self._KY = None; self._R = None; self._TH = None
         self.calib = Calibration()
         self.mode: str = 'idle'
         self.pending_pts: list[tuple[float, float]] = []
@@ -114,6 +139,7 @@ class UltrasoundFilterGUI(QWidget):
         self.D_mm: float | None = None
         self.lam_mm: float | None = None
         self.f_mhz: float | None = None
+        self.filter_enabled: bool = False  # stays False until line FFT is done
         self._dialogs = []
         self.canvas = MplCanvas()
         self.cid_click = self.canvas.mpl_connect('button_press_event', self._on_canvas_click)
@@ -122,16 +148,21 @@ class UltrasoundFilterGUI(QWidget):
         left_wrap = QWidget(); lw = QVBoxLayout(left_wrap); lw.setContentsMargins(4,4,4,4); lw.addWidget(self.canvas)
         splitter.addWidget(left_wrap); splitter.addWidget(right_panel)
         splitter.setCollapsible(0, False); splitter.setCollapsible(1, False)
-        splitter.setSizes([1000, 400])
+        splitter.setSizes([1040, 440])
         root = QHBoxLayout(self); root.addWidget(splitter)
         self._load_synthetic()
         self._update_everything()
+
     def _build_right_panel(self) -> QWidget:
         panel = QWidget(); v = QVBoxLayout(panel); v.setContentsMargins(8,8,8,8); v.setSpacing(10)
+
+        # Data
         g_data = QGroupBox('Data'); h_data = QHBoxLayout(g_data)
         self.btn_load = QPushButton('Load Image…'); self.btn_load.clicked.connect(self._on_load_image)
         self.btn_reset = QPushButton('Reset View'); self.btn_reset.clicked.connect(self._reset_view)
         h_data.addWidget(self.btn_load); h_data.addWidget(self.btn_reset); h_data.addStretch(1)
+
+        # Calibration
         g_cal = QGroupBox('Calibration'); f_cal = QFormLayout(g_cal)
         self.spin_mmpp = QDoubleSpinBox(); self.spin_mmpp.setRange(1e-6, 1e3); self.spin_mmpp.setSingleStep(0.001); self.spin_mmpp.setDecimals(6); self.spin_mmpp.setValue(self.calib.mm_per_pixel); self.spin_mmpp.valueChanged.connect(self._on_calib_changed)
         self.spin_speed = QDoubleSpinBox(); self.spin_speed.setRange(100.0, 4000.0); self.spin_speed.setSingleStep(1.0); self.spin_speed.setDecimals(1); self.spin_speed.setValue(self.calib.speed_ms); self.spin_speed.valueChanged.connect(self._on_calib_changed)
@@ -139,23 +170,50 @@ class UltrasoundFilterGUI(QWidget):
         f_cal.addRow('mm / pixel', self.spin_mmpp)
         f_cal.addRow('Speed (m/s)', self.spin_speed)
         f_cal.addRow('Pattern → k(λ)', self.combo_pattern)
-        g_mhz = QGroupBox('Image Bandpass [MHz]'); f_mhz = QFormLayout(g_mhz)
-        self.spin_fmin = QDoubleSpinBox(); self.spin_fmin.setRange(1.0, 10.0); self.spin_fmin.setSingleStep(0.1); self.spin_fmin.setDecimals(2); self.spin_fmin.setValue(1.0); self.spin_fmin.valueChanged.connect(self._on_freq_changed)
-        self.spin_fmax = QDoubleSpinBox(); self.spin_fmax.setRange(1.0, 10.0); self.spin_fmax.setSingleStep(0.1); self.spin_fmax.setDecimals(2); self.spin_fmax.setValue(10.0); self.spin_fmax.valueChanged.connect(self._on_freq_changed)
+
+        # Filtering settings (gated after FFT)
+        g_mhz = QGroupBox('Filtering (applied ONLY after line FFT)'); f_mhz = QFormLayout(g_mhz)
+        self.spin_fmin = QDoubleSpinBox(); self.spin_fmin.setRange(0.1, 30.0); self.spin_fmin.setSingleStep(0.1); self.spin_fmin.setDecimals(2); self.spin_fmin.setValue(1.0); self.spin_fmin.valueChanged.connect(self._on_freq_changed)
+        self.spin_fmax = QDoubleSpinBox(); self.spin_fmax.setRange(0.1, 30.0); self.spin_fmax.setSingleStep(0.1); self.spin_fmax.setDecimals(2); self.spin_fmax.setValue(10.0); self.spin_fmax.valueChanged.connect(self._on_freq_changed)
         self.slider_taper = QSlider(Qt.Horizontal); self.slider_taper.setRange(0, 40); self.slider_taper.setValue(15); self.slider_taper.valueChanged.connect(self._on_freq_changed)
         self.lbl_taper = QLabel('15 %')
+        self.chk_enable_after_fft = QCheckBox('Enable filter only after FFT'); self.chk_enable_after_fft.setChecked(True); self.chk_enable_after_fft.stateChanged.connect(self._on_freq_changed)
+        self.combo_method = QComboBox(); self.combo_method.addItems(['1D line‑by‑line (rotate + per‑row FFT)', '2D FFT wedge']); self.combo_method.currentIndexChanged.connect(self._on_freq_changed)
+
+        # Direction controls (used by both methods)
+        self.chk_use_lineang = QCheckBox('Use line angle θ'); self.chk_use_lineang.setChecked(True); self.chk_use_lineang.stateChanged.connect(self._on_freq_changed)
+        self.chk_perp = QCheckBox('Perpendicular (⊥)'); self.chk_perp.setChecked(False); self.chk_perp.stateChanged.connect(self._on_freq_changed)
+        self.chk_auto_theta = QCheckBox('Auto‑angle (2D spectrum)'); self.chk_auto_theta.setChecked(False); self.chk_auto_theta.stateChanged.connect(self._on_freq_changed)
+        self.spin_theta = QDoubleSpinBox(); self.spin_theta.setRange(-180.0, 180.0); self.spin_theta.setDecimals(1); self.spin_theta.setSingleStep(1.0); self.spin_theta.setValue(0.0); self.spin_theta.valueChanged.connect(self._on_freq_changed)
+        self.spin_halfdeg = QDoubleSpinBox(); self.spin_halfdeg.setRange(1.0, 90.0); self.spin_halfdeg.setDecimals(1); self.spin_halfdeg.setSingleStep(1.0); self.spin_halfdeg.setValue(20.0); self.spin_halfdeg.valueChanged.connect(self._on_freq_changed)
+        self.lbl_theta_src = QLabel('θ: —')
+
         f_mhz.addRow('Min f (MHz)', self.spin_fmin)
         f_mhz.addRow('Max f (MHz)', self.spin_fmax)
         f_mhz.addRow('Edge taper', self._row(self.slider_taper, self.lbl_taper))
+        f_mhz.addRow('Method', self.combo_method)
+        f_mhz.addRow(self.chk_enable_after_fft)
+        f_mhz.addRow(self.chk_use_lineang)
+        f_mhz.addRow(self._row(self.chk_perp, QLabel(' (check if your line is along the fringes)')))
+        f_mhz.addRow(self.chk_auto_theta)
+        f_mhz.addRow('Angle θ (°)', self.spin_theta)
+        f_mhz.addRow('Half‑angle (°) [2D only]', self.spin_halfdeg)
+        f_mhz.addRow('θ source', self.lbl_theta_src)
+
+        # Tools
         g_tools = QGroupBox('Tools'); v_tools = QVBoxLayout(g_tools)
         self.btn_calib = QPushButton('Calibrate px↔mm (2 clicks)'); self.btn_calib.clicked.connect(self._start_calibrate)
         self.btn_line = QPushButton('Select line for 1D FFT'); self.btn_line.clicked.connect(self._start_line_fft)
         self.btn_diam = QPushButton('Measure beam diameter (2 clicks)'); self.btn_diam.clicked.connect(self._start_beam_diam)
         self.btn_sim = QPushButton('Simulate beam…'); self.btn_sim.clicked.connect(self._simulate_beam)
         v_tools.addWidget(self.btn_calib); v_tools.addWidget(self.btn_line); v_tools.addWidget(self.btn_diam); v_tools.addWidget(self.btn_sim)
+
+        # Processing
         g_proc = QGroupBox('Processing'); v_proc = QVBoxLayout(g_proc)
-        self.btn_apply = QPushButton('Apply Now'); self.btn_apply.clicked.connect(self._update_everything)
+        self.btn_apply = QPushButton('Apply / Refresh'); self.btn_apply.clicked.connect(self._update_everything)
         v_proc.addWidget(self.btn_apply); v_proc.addStretch(1)
+
+        # Metrics
         g_met = QGroupBox('Metrics'); f_met = QFormLayout(g_met)
         self.lbl_mmpp = QLabel('—'); self.lbl_D = QLabel('—'); self.lbl_lambda = QLabel('—'); self.lbl_freq = QLabel('—'); self.lbl_rayleigh = QLabel('—')
         f_met.addRow('mm / pixel', self.lbl_mmpp)
@@ -163,14 +221,18 @@ class UltrasoundFilterGUI(QWidget):
         f_met.addRow('λ from line [mm]', self.lbl_lambda)
         f_met.addRow('f from line [MHz]', self.lbl_freq)
         f_met.addRow('Rayleigh N [mm]', self.lbl_rayleigh)
+
         v.addWidget(g_data); v.addWidget(g_cal); v.addWidget(g_mhz); v.addWidget(g_tools); v.addWidget(g_proc); v.addWidget(g_met); v.addStretch(1)
         return panel
+
     @staticmethod
     def _row(*widgets):
         w = QWidget(); h = QHBoxLayout(w); h.setContentsMargins(0,0,0,0)
         for x in widgets: h.addWidget(x)
         h.addStretch(1)
         return w
+
+    # --------------------- IO / setup ---------------------
     def _on_load_image(self):
         path, _ = QFileDialog.getOpenFileName(self, 'Open image', os.getcwd(), 'Images (*.png *.jpg *.jpeg *.bmp *.tif *.tiff)')
         if not path:
@@ -183,9 +245,13 @@ class UltrasoundFilterGUI(QWidget):
             if img.max() > 1.0:
                 img = img / 255.0
             self._set_image(img)
+            # Reset gating so the user sees a clean, unfiltered image for clicks
+            self.filter_enabled = False
         except Exception as e:
-            QMessageBox.critical(self, 'Load error', 'Could not open image:\n{}'.format(e))
+            QMessageBox.critical(self, 'Load error', f"Could not open image:{e}")
+
     def _load_synthetic(self):
+        # A synthetic image with two spatial tones + Gaussian envelope
         h, w = 512, 768
         y, x = np.mgrid[0:h, 0:w]
         def mk_wave(f_MHz, calib: Calibration):
@@ -203,26 +269,34 @@ class UltrasoundFilterGUI(QWidget):
         img = (base*mask + 0.02*np.random.randn(h, w)).astype(np.float64)
         img = (img - img.min()) / (img.max() - img.min())
         self._set_image(img)
+
     def _set_image(self, img: np.ndarray):
         self.orig_img = img
         self._prepare_fft()
         self._update_everything()
+
     def _prepare_fft(self):
         if self.orig_img is None:
-            self.fft_cache = None; self.freq_grid_cpp = None; return
+            self.fft_cache = None; self._KX = self._KY = self._R = self._TH = None; return
         img = self.orig_img
         self.fft_cache = np.fft.fftshift(np.fft.fft2(img))
         h, w = img.shape
-        ky = np.fft.fftfreq(h)
+        ky = np.fft.fftfreq(h)  # cycles/pixel
         kx = np.fft.fftfreq(w)
-        kx, ky = np.meshgrid(kx, ky)
-        self.freq_grid_cpp = np.sqrt(kx**2 + ky**2)
+        KX, KY = np.meshgrid(kx, ky)
+        self._KX = KX
+        self._KY = KY
+        self._R = np.sqrt(KX**2 + KY**2)
+        self._TH = np.arctan2(KY, KX)
+
+    # --------------------- parameter changes ---------------------
     def _on_calib_changed(self):
         self.calib.mm_per_pixel = float(self.spin_mmpp.value())
         self.calib.speed_ms = float(self.spin_speed.value())
         self.calib.standing_wave = (self.combo_pattern.currentIndex() == 0)
         self._update_metrics()
         self._update_everything()
+
     def _on_freq_changed(self, *_):
         try:
             fmin = float(self.spin_fmin.value()); fmax = float(self.spin_fmax.value())
@@ -234,9 +308,12 @@ class UltrasoundFilterGUI(QWidget):
             self._update_everything()
         except Exception:
             return
+
     def _reset_view(self):
         self.canvas.ax.set_xlim(auto=True); self.canvas.ax.set_ylim(auto=True)
         self.canvas.figure.canvas.draw_idle()
+
+    # --------------------- math helpers ---------------------
     def _mhz_band_to_cycles_per_pixel(self, fmin_mhz: float, fmax_mhz: float) -> tuple[float, float]:
         mmpp = max(1e-12, float(self.calib.mm_per_pixel))
         c_ms = max(1e-12, float(self.calib.speed_ms))
@@ -245,10 +322,11 @@ class UltrasoundFilterGUI(QWidget):
             f_hz = f_mhz * 1e6
             lam_mm = (c_ms * 1000.0) / f_hz
             k_mm = factor / lam_mm
-            return k_mm * mmpp
+            return k_mm * mmpp  # cycles/pixel
         kmin_cpp = single(fmin_mhz); kmax_cpp = single(fmax_mhz)
         if kmin_cpp > kmax_cpp: kmin_cpp, kmax_cpp = kmax_cpp, kmin_cpp
         return kmin_cpp, kmax_cpp
+
     @staticmethod
     def _raised_cosine_taper(x: np.ndarray, lo: float, hi: float, pct: float) -> np.ndarray:
         lo, hi = float(lo), float(hi)
@@ -268,26 +346,153 @@ class UltrasoundFilterGUI(QWidget):
             xi = 1 - (x[idx] - b0) / max(1e-12, (b1 - b0))
             m[idx] = 0.5 * (1 - np.cos(np.pi * xi))
         return m
-    def _apply_bandpass(self) -> np.ndarray:
-        if self.orig_img is None or self.fft_cache is None or self.freq_grid_cpp is None:
-            return np.zeros((512, 512))
-        try:
-            fmin = float(self.spin_fmin.value()); fmax = float(self.spin_fmax.value()); taper_pct = float(self.slider_taper.value())
-        except Exception:
-            return self.orig_img if self.orig_img is not None else np.zeros((512, 512))
+
+    @staticmethod
+    def _angdiff(a: np.ndarray, b: float) -> np.ndarray:
+        """Smallest signed angular difference wrap to [-π, π]."""
+        return np.arctan2(np.sin(a - b), np.cos(a - b))
+
+    def _wedge_mask(self, theta_grid: np.ndarray, theta0_deg: float, half_deg: float, pct: float) -> np.ndarray:
+        """Raised‑cosine wedge mask centered at ±theta0 with half width half_deg.
+        Returns values in [0,1]."""
+        th0 = np.deg2rad(theta0_deg)
+        half = np.deg2rad(max(1e-3, half_deg))
+        t = np.clip(pct/100.0, 0.0, 0.9)
+        ramp = t * half
+        flat = max(0.0, half - ramp)
+
+        def single(center):
+            d = np.abs(self._angdiff(theta_grid, center))  # [0, π]
+            m = np.zeros_like(d)
+            # flat 1 region
+            m = np.where(d <= flat, 1.0, m)
+            # ramp down to 0 between flat..(flat+ramp)
+            idx = (d > flat) & (d <= flat + ramp)
+            if np.any(idx):
+                xi = 1.0 - (d[idx] - flat) / max(1e-12, ramp)
+                m[idx] = 0.5 * (1 - np.cos(np.pi * xi))
+            return m
+
+        m_pos = single(+th0)
+        m_neg = single(-th0)
+        return np.maximum(m_pos, m_neg)
+
+    def _line_angle_deg(self, use_perp: bool=False) -> float | None:
+        if self.line_pts is None:
+            return None
+        (x1, y1), (x2, y2) = self.line_pts
+        dx = x2 - x1; dy = y2 - y1
+        ang = np.degrees(np.arctan2(dy, dx))
+        if use_perp:
+            ang += 90.0
+        ang = (ang + 180.0) % 360.0 - 180.0
+        return float(ang)
+
+    def _estimate_theta_deg(self, kmin_cpp: float) -> float:
+        if self.fft_cache is None or self._R is None or self._TH is None:
+            return 0.0
+        M = np.abs(self.fft_cache)
+        mask = (self._R >= max(kmin_cpp*0.8, 0.01))
+        if not np.any(mask):
+            return 0.0
+        idx = np.argmax(M * mask)
+        iy, ix = np.unravel_index(int(idx), M.shape)
+        th = float(self._TH[iy, ix])
+        return np.rad2deg(th)
+
+    # --------------------- Filtering backends ---------------------
+    def _filter_1d_linebyline(self, fmin, fmax, taper_pct) -> np.ndarray:
+        """Rotate image so the selected line is horizontal, band‑pass each row via 1‑D FFT,
+        rotate back, and center‑crop to original size."""
+        if self.orig_img is None:
+            return np.zeros((512,512))
+        angle = 0.0
+        src = 'manual'
+        if self.chk_use_lineang.isChecked() and (self.line_pts is not None):
+            a = self._line_angle_deg(use_perp=self.chk_perp.isChecked())
+            if a is not None:
+                angle = a
+                src = 'line'
+        elif self.chk_auto_theta.isChecked():
+            # Use 2D spectrum to estimate
+            kmin_cpp, _ = self._mhz_band_to_cycles_per_pixel(fmin, fmax)
+            angle = self._estimate_theta_deg(kmin_cpp)
+            src = 'auto'
+        else:
+            angle = float(self.spin_theta.value())
+            src = 'manual'
+        self.lbl_theta_src.setText(f"θ_{src}: {angle:+.1f}°")
+
+        # Rotate so the selected line becomes (approximately) horizontal
+        img_rot = rotate(self.orig_img, -angle, resize=True, order=1, mode='reflect', preserve_range=True)
+        img_rot = img_rot.astype(np.float64)
+        H, W = img_rot.shape
+
+        # 1‑D FFT along rows
+        F = np.fft.rfft(img_rot, axis=1)
+        freqs_cpp = np.fft.rfftfreq(W, d=1.0)
         kmin_cpp, kmax_cpp = self._mhz_band_to_cycles_per_pixel(fmin, fmax)
-        r = self.freq_grid_cpp
-        mask = self._raised_cosine_taper(r, kmin_cpp, kmax_cpp, taper_pct)
-        F = self.fft_cache * mask
+        mask = self._raised_cosine_taper(freqs_cpp, kmin_cpp, kmax_cpp, taper_pct)
+        F_filtered = F * mask[None, :]
+        rec_rot = np.fft.irfft(F_filtered, n=W, axis=1)
+
+        # Rotate back and center‑crop to original size
+        rec = rotate(rec_rot, angle, resize=True, order=1, mode='reflect', preserve_range=True)
+        rec = rec.astype(np.float64)
+        rec = self._center_crop_like(rec, self.orig_img)
+        return rec
+
+    def _center_crop_like(self, arr: np.ndarray, ref: np.ndarray) -> np.ndarray:
+        h, w = ref.shape
+        H, W = arr.shape
+        y0 = max(0, (H - h)//2); x0 = max(0, (W - w)//2)
+        out = arr[y0:y0+h, x0:x0+w]
+        if out.shape != ref.shape:
+            # If rotated result is smaller, pad reflectively
+            pad_y = max(0, h - out.shape[0]); pad_x = max(0, w - out.shape[1])
+            out = np.pad(out, ((pad_y//2, pad_y - pad_y//2), (pad_x//2, pad_x - pad_x//2)), mode='reflect')
+            out = out[:h, :w]
+        return out
+
+    def _filter_2d_wedge(self, fmin, fmax, taper_pct) -> np.ndarray:
+        if self.orig_img is None or self.fft_cache is None or self._R is None:
+            return np.zeros((512, 512))
+        kmin_cpp, kmax_cpp = self._mhz_band_to_cycles_per_pixel(fmin, fmax)
+        Mr = self._raised_cosine_taper(self._R, kmin_cpp, kmax_cpp, taper_pct)
+        # Angle
+        theta0 = float(self.spin_theta.value()); src='manual'
+        if self.chk_use_lineang.isChecked() and (self.line_pts is not None):
+            ang = self._line_angle_deg(use_perp=self.chk_perp.isChecked())
+            if ang is not None:
+                theta0 = ang; src='line'
+        elif self.chk_auto_theta.isChecked():
+            theta0 = self._estimate_theta_deg(kmin_cpp); src='auto'
+        self.lbl_theta_src.setText(f"θ_{src}: {theta0:+.1f}°")
+        Mt = self._wedge_mask(self._TH, theta0, float(self.spin_halfdeg.value()), taper_pct)
+        M = Mr * Mt
+        F = self.fft_cache * M
         rec = np.fft.ifft2(np.fft.ifftshift(F)).real
         return rec
+
+    # --------------------- draw / GUI ---------------------
     def _update_everything(self):
-        if self.orig_img is None: return
+        if self.orig_img is None:
+            return
         try:
-            out = self._apply_bandpass()
+            # Decide whether to filter yet
+            do_filter = self.filter_enabled or (not self.chk_enable_after_fft.isChecked())
+            if not do_filter:
+                out = self.orig_img
+            else:
+                fmin = float(self.spin_fmin.value()); fmax = float(self.spin_fmax.value()); taper = float(self.slider_taper.value())
+                if self.combo_method.currentIndex() == 0:
+                    out = self._filter_1d_linebyline(fmin, fmax, taper)
+                else:
+                    out = self._filter_2d_wedge(fmin, fmax, taper)
             self._draw_image(out)
         except Exception as e:
             QMessageBox.critical(self, 'Processing error', str(e))
+
     def _draw_image(self, img: np.ndarray):
         ax = self.canvas.ax
         ax.clear(); ax.set_axis_off()
@@ -299,15 +504,20 @@ class UltrasoundFilterGUI(QWidget):
             (x1,y1),(x2,y2) = self.beam_pts
             ax.plot([x1,x2],[y1,y2],'m-',lw=2,alpha=0.9)
         self.canvas.draw_idle()
+
+    # --------------------- user tools ---------------------
     def _start_calibrate(self):
         self.mode = 'calibrate'; self.pending_pts = []
         QMessageBox.information(self, 'Calibration', 'Click two points a known distance apart (mm).')
+
     def _start_line_fft(self):
         self.mode = 'line_fft'; self.pending_pts = []
         QMessageBox.information(self, 'Line FFT', 'Click two points to define the analysis line.')
+
     def _start_beam_diam(self):
         self.mode = 'beam_diam'; self.pending_pts = []
         QMessageBox.information(self, 'Beam diameter', 'Click two points across the beam aperture edge-to-edge.')
+
     def _on_canvas_click(self, event):
         if event.inaxes != self.canvas.ax: return
         if self.mode == 'idle': return
@@ -326,6 +536,7 @@ class UltrasoundFilterGUI(QWidget):
         elif self.mode == 'beam_diam':
             self._finish_beam_diameter(p1, p2)
         self.mode = 'idle'
+
     def _finish_calibration(self, p1, p2):
         dx = p2[0]-p1[0]; dy = p2[1]-p1[1]
         pix_dist = float(np.hypot(dx, dy))
@@ -343,6 +554,7 @@ class UltrasoundFilterGUI(QWidget):
         self.spin_mmpp.blockSignals(True); self.spin_mmpp.setValue(self.calib.mm_per_pixel); self.spin_mmpp.blockSignals(False)
         self.line_pts = (p1, p2)
         self._update_metrics(); self.canvas.draw_idle()
+
     def _finish_line_fft(self, p1, p2):
         self.line_pts = (p1, p2)
         self.canvas.draw_idle()
@@ -374,15 +586,24 @@ class UltrasoundFilterGUI(QWidget):
         f_mhz = self.calib.speed_ms / (1000.0 * lam_mm)
         self.lam_mm = float(lam_mm); self.f_mhz = float(f_mhz)
         self._update_metrics()
+
+        # Enable filtering now that the line FFT has been done
+        if self.chk_enable_after_fft.isChecked():
+            self.filter_enabled = True
+        # Show the line FFT dialog
         dlg = FFTDialog(self)
         dlg.update_plots(s_mm, prof, freqs_cmm, spec, self.lam_mm, self.f_mhz)
         dlg.show(); self._dialogs.append(dlg)
+        self._update_everything()
+
     def _finish_beam_diameter(self, p1, p2):
         self.beam_pts = (p1, p2)
         self.canvas.draw_idle()
         pix_dist = float(np.hypot(p2[0]-p1[0], p2[1]-p1[1]))
         self.D_mm = pix_dist * max(1e-12, self.calib.mm_per_pixel)
         self._update_metrics()
+
+    # --------------------- metrics / sim ---------------------
     def _update_metrics(self):
         self.lbl_mmpp.setText(f"{self.calib.mm_per_pixel:.6f}")
         self.lbl_D.setText('—' if self.D_mm is None else f"{self.D_mm:.4f}")
@@ -393,6 +614,7 @@ class UltrasoundFilterGUI(QWidget):
             self.lbl_rayleigh.setText(f"{N_mm:.2f}")
         else:
             self.lbl_rayleigh.setText('—')
+
     def _simulate_beam(self):
         if self.D_mm is None or self.lam_mm is None:
             QMessageBox.warning(self, 'Beam simulation', 'Measure beam diameter and extract λ from line FFT first.')
@@ -433,6 +655,8 @@ class UltrasoundFilterGUI(QWidget):
             sim.show(); self._dialogs.append(sim)
         except Exception as e:
             QMessageBox.critical(self, 'Simulation error', str(e))
+
+# --------------------- main ---------------------
 
 def main():
     app = QApplication(sys.argv)
