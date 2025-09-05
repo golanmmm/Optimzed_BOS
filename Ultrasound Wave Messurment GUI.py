@@ -27,17 +27,22 @@ from skimage.measure import profile_line
 
 # -------------------- Tiny tkinter helpers --------------------
 def ask_float(title, prompt, initial=None, minvalue=None):
-    root = Tk(); root.withdraw(); root.update()
+    root = Tk();
+    root.withdraw();
+    root.update()
     val = simpledialog.askfloat(title, prompt, initialvalue=initial, minvalue=minvalue)
     root.destroy()
     return val
 
+
 def pick_file():
-    root = Tk(); root.withdraw(); root.update()
+    root = Tk();
+    root.withdraw();
+    root.update()
     path = filedialog.askopenfilename(
         title="Choose an image",
-        filetypes=[("Images","*.png;*.jpg;*.jpeg;*.tif;*.tiff;*.bmp;*.gif"),
-                   ("All files","*.*")]
+        filetypes=[("Images", "*.png;*.jpg;*.jpeg;*.tif;*.tiff;*.bmp;*.gif"),
+                   ("All files", "*.*")]
     )
     root.destroy()
     if not path:
@@ -56,12 +61,14 @@ def to_grayscale_float(img):
         img = (img - img.min()) / (img.max() - img.min() + 1e-12)
     return img
 
+
 def normalize01(a):
     a = np.asarray(a, dtype=np.float32)
     mn, mx = float(np.min(a)), float(np.max(a))
     if mx > mn:
         return (a - mn) / (mx - mn)
     return np.zeros_like(a)
+
 
 def gaussian_background_subtract(image, radius_mm, mm_per_px):
     if radius_mm is None or radius_mm <= 0:
@@ -72,18 +79,19 @@ def gaussian_background_subtract(image, radius_mm, mm_per_px):
     bg = gaussian(image, sigma=sigma_px, preserve_range=True)
     return image - bg
 
+
 def bandpass_2d_fft(image, mm_per_px, low_cmm=None, high_cmm=None):
     """Hard annular mask in 2D frequency domain. Cutoffs in cycles/mm."""
     H, W = image.shape
     fx = np.fft.fftshift(np.fft.fftfreq(W, d=1.0))  # cycles/pixel
     fy = np.fft.fftshift(np.fft.fftfreq(H, d=1.0))
     FX, FY = np.meshgrid(fx, fy)
-    R_cpx = np.sqrt(FX**2 + FY**2)
+    R_cpx = np.sqrt(FX ** 2 + FY ** 2)
 
     def cmm_to_cpx(cmm):  # cycles/mm -> cycles/pixel
         return (cmm or 0.0) * mm_per_px
 
-    low_cpx  = cmm_to_cpx(low_cmm)
+    low_cpx = cmm_to_cpx(low_cmm)
     high_cpx = cmm_to_cpx(high_cmm) if (high_cmm is not None and high_cmm > 0) else None
 
     F = np.fft.fft2(image)
@@ -93,6 +101,7 @@ def bandpass_2d_fft(image, mm_per_px, low_cmm=None, high_cmm=None):
     if high_cpx is not None:      mask &= (R_cpx <= high_cpx)
     Ff = Fsh * mask
     return np.fft.ifft2(np.fft.ifftshift(Ff)).real
+
 
 def line_fft(profile):
     n = len(profile)
@@ -105,6 +114,7 @@ def line_fft(profile):
     mag = np.abs(spec) / n
     return freqs_px, mag
 
+
 def bandpass_1d_fft(profile, mm_per_px, low_cmm=None, high_cmm=None):
     n = len(profile)
     spec = np.fft.fft(profile - np.mean(profile))
@@ -113,7 +123,7 @@ def bandpass_1d_fft(profile, mm_per_px, low_cmm=None, high_cmm=None):
     def cmm_to_cpx(cmm):  # cycles/mm -> cycles/pixel
         return (cmm or 0.0) * mm_per_px
 
-    low_cpx  = cmm_to_cpx(low_cmm)
+    low_cpx = cmm_to_cpx(low_cmm)
     high_cpx = cmm_to_cpx(high_cmm) if (high_cmm is not None and high_cmm > 0) else None
 
     mask = np.ones_like(freqs_px, dtype=bool)
@@ -137,26 +147,26 @@ def simulate_piston_field(D_mm, lam_mm, z_max_mm, span_mult_D=4.0, Nx=256, Nz=16
         return None
     if lam_mm is None or not np.isfinite(lam_mm) or lam_mm <= 0:
         return None
-    a_mm   = D_mm / 2.0
-    k_mm   = 2.0 * np.pi / lam_mm  # rad/mm
-    Lx_mm  = max(span_mult_D * D_mm, 4.0 * D_mm)
-    dx_mm  = Lx_mm / Nx
-    x = (np.arange(Nx) - Nx//2) * dx_mm
+    a_mm = D_mm / 2.0
+    k_mm = 2.0 * np.pi / lam_mm  # rad/mm
+    Lx_mm = max(span_mult_D * D_mm, 4.0 * D_mm)
+    dx_mm = Lx_mm / Nx
+    x = (np.arange(Nx) - Nx // 2) * dx_mm
     y = x.copy()
     X, Y = np.meshgrid(x, y)
     # Aperture at z=0
-    U0 = (X**2 + Y**2) <= (a_mm**2)
+    U0 = (X ** 2 + Y ** 2) <= (a_mm ** 2)
     U0 = U0.astype(np.complex64)
     # Precompute angular spectrum of source plane
     F0 = np.fft.fft2(U0)
-    fx = np.fft.fftfreq(Nx, d=dx_mm)   # cycles/mm
-    kx = 2.0 * np.pi * fx              # rad/mm
-    KX, KY = np.meshgrid(kx, kx)       # using same for y (square grid)
-    Ksq = KX**2 + KY**2
+    fx = np.fft.fftfreq(Nx, d=dx_mm)  # cycles/mm
+    kx = 2.0 * np.pi * fx  # rad/mm
+    KX, KY = np.meshgrid(kx, kx)  # using same for y (square grid)
+    Ksq = KX ** 2 + KY ** 2
     # Evanescent components cutoff
-    mask_prop = Ksq <= (k_mm**2)
+    mask_prop = Ksq <= (k_mm ** 2)
     KZ = np.zeros_like(KX, dtype=np.float32)
-    KZ[mask_prop] = np.sqrt((k_mm**2) - Ksq[mask_prop]).astype(np.float32)
+    KZ[mask_prop] = np.sqrt((k_mm ** 2) - Ksq[mask_prop]).astype(np.float32)
     # z sampling
     z = np.linspace(0.0, z_max_mm, Nz, dtype=np.float32)
     # Collect x–z map (center row) and on-axis
@@ -167,8 +177,8 @@ def simulate_piston_field(D_mm, lam_mm, z_max_mm, span_mult_D=4.0, Nx=256, Nz=16
         H[mask_prop] = np.exp(1j * KZ[mask_prop] * zi).astype(np.complex64)
         Uz = np.fft.ifft2(F0 * H)
         Iz = (Uz * Uz.conj()).real.astype(np.float32)
-        I_xz[i, :] = Iz[Nx//2, :]              # center row (y=0) vs x
-        I_axis[i]  = Iz[Nx//2, Nx//2]          # on-axis (x=0,y=0)
+        I_xz[i, :] = Iz[Nx // 2, :]  # center row (y=0) vs x
+        I_axis[i] = Iz[Nx // 2, Nx // 2]  # on-axis (x=0,y=0)
     # Normalize to max = 1 for readability
     maxI = float(np.max(I_xz))
     if maxI > 0:
@@ -214,15 +224,17 @@ def main():
         "um_per_px": um_per_px,
         "mm_per_px": mm_per_px,
         "nyq_cmm": nyq_cmm,
-        "bg_mm": 0.2,
+        "bg_mm": 0.0,
         "low_cmm": 0.0,
         "high_cmm": nyq_cmm,
-        "v_mps": 1497.0,     # water @ ~25 °C
+        "v_mps": 1497.0,  # water @ ~25 °C
         "use_speed": True,
-        "intensity_case": True,   # standing-wave intensity by default
-        "line_pts": None,         # ((x0,y0),(x1,y1))
-        "diam_pts": None,         # ((x0,y0),(x1,y1)) for transducer diameter
-        "D_mm": None,             # measured diameter
+        "fmin_MHz": 1.0,
+        "fmax_MHz": 10.0,
+        "intensity_case": True,  # standing-wave intensity by default
+        "line_pts": None,  # ((x0,y0),(x1,y1))
+        "diam_pts": None,  # ((x0,y0),(x1,y1)) for transducer diameter
+        "D_mm": None,  # measured diameter
         "secax": None,
         "metrics_text": None,
         "selecting_line": False,
@@ -230,8 +242,8 @@ def main():
         "hint_text": None,
         # Simulation cache
         "sim_x": None, "sim_z": None, "sim_Ixz": None, "sim_Iaxis": None,
-        "sim_z_multN": 2.0,   # z max = sim_z_multN * N
-        "sim_span_multD": 4.0 # lateral span = sim_span_multD * D
+        "sim_z_multN": 2.0,  # z max = sim_z_multN * N
+        "sim_span_multD": 4.0  # lateral span = sim_span_multD * D
     }
 
     # -------------------- Figure layout (native pixels for top image) --------------------
@@ -244,21 +256,21 @@ def main():
     DPI = 100  # 1 image pixel -> 1 figure pixel at this DPI
 
     # Column widths in inches: left = image native width, right = control panel width
-    left_w_in  = W / DPI
+    left_w_in = W / DPI
     right_w_in = 5.2  # good width to avoid slider overlap
 
     # Row heights in inches: top = image native height; others fixed but roomy
-    top_h_in   = H / DPI
-    spec_h_in  = 2.4
-    sim_h_in   = 3.0
+    top_h_in = H / DPI
+    spec_h_in = 2.4
+    sim_h_in = 3.0
 
     # Compute overall figure size from absolute inches and relative margins
     FIG_W = (left_w_in + right_w_in) / (RIGHT - LEFT)
     FIG_H = (top_h_in + spec_h_in + sim_h_in) / (TOP - BOTTOM)
 
     # Ratios for GridSpec (proportional to inch sizes)
-    WIDTH_RATIOS  = [left_w_in, right_w_in]
-    HEIGHT_RATIOS = [top_h_in,  spec_h_in,  sim_h_in]
+    WIDTH_RATIOS = [left_w_in, right_w_in]
+    HEIGHT_RATIOS = [top_h_in, spec_h_in, sim_h_in]
 
     plt.close("all")
     fig = plt.figure(figsize=(FIG_W, FIG_H), dpi=DPI)
@@ -269,10 +281,11 @@ def main():
         left=LEFT, right=RIGHT, top=TOP, bottom=BOTTOM,
         wspace=WSPACE, hspace=HSPACE
     )
-    ax_img   = fig.add_subplot(gs[0, 0])      # TOP: filtered image (native size)
-    ax_spec  = fig.add_subplot(gs[1, 0])      # MIDDLE: 1D FFT along line
-    ax_sim   = fig.add_subplot(gs[2, 0])      # BOTTOM: x–z intensity map
-    ax_panel = fig.add_subplot(gs[:, 1]); ax_panel.axis("off")
+    ax_img = fig.add_subplot(gs[0, 0])  # TOP: filtered image (native size)
+    ax_spec = fig.add_subplot(gs[1, 0])  # MIDDLE: 1D FFT along line
+    ax_sim = fig.add_subplot(gs[2, 0])  # BOTTOM: x–z intensity map
+    ax_panel = fig.add_subplot(gs[:, 1]);
+    ax_panel.axis("off")
 
     # enforce exact aspect on the image axes (no stretching)
     try:
@@ -288,7 +301,7 @@ def main():
         bbox=dict(facecolor='white', alpha=0.6, edgecolor='none')
     )
 
-        # --------- Control panel stacking helper (prevents overlap) ---------
+    # --------- Control panel stacking helper (prevents overlap) ---------
     panel_pos = ax_panel.get_position()
     px, py = panel_pos.x0, panel_pos.y0
     pw, ph = panel_pos.width, panel_pos.height
@@ -296,7 +309,7 @@ def main():
     # ===== Dedicated RESULTS panel at the very top (separate, readable, no overlap) =====
     # Reserve ~22% of the right panel height for a framed results box
     metrics_h = 0.22 * ph
-    metrics_ax = fig.add_axes([px + 0.03*pw, panel_pos.y1 - metrics_h - 0.01, 0.94*pw, metrics_h])
+    metrics_ax = fig.add_axes([px + 0.03 * pw, panel_pos.y1 - metrics_h - 0.01, 0.94 * pw, metrics_h])
     metrics_ax.set_facecolor("#f7f7f7")
     for s in metrics_ax.spines.values():
         s.set_visible(True)
@@ -311,35 +324,32 @@ def main():
     )
 
     # --------- Control panel stacking helper (controls start BELOW the results box) ---------
-    y = metrics_ax.get_position().y0 - 0.02
+    y_pos = [metrics_ax.get_position().y0 - 0.02]
 
     def add_box(rel_w=0.95, h=0.055, gap=0.014):
-        nonlocal y
         w = pw * rel_w
         x = px + (pw - w) / 2
-        ax = fig.add_axes([x, y, w, h])
-        y -= (h + gap)
+        ax = fig.add_axes([x, y_pos[0], w, h])
+        y_pos[0] -= (h + gap)
         return ax
 
-    # Sliders
-    sl_bg   = Slider(add_box(), "BG radius (mm)", 0.0, 5.0, valinit=state["bg_mm"])
-    sl_low  = Slider(add_box(), "Low (c/mm)",     0.0, nyq_cmm, valinit=state["low_cmm"])
-    sl_high = Slider(add_box(), "High (c/mm)",    0.0, nyq_cmm, valinit=state["high_cmm"])
+    # Frequency (intensity) range sliders (MHz)
+    sl_fmin = Slider(add_box(), "Min f_int (MHz)", 1.0, 10.0, valinit=1.0)
+    sl_fmax = Slider(add_box(), "Max f_int (MHz)", 1.0, 10.0, valinit=10.0)
 
     # Speed textbox
     txt_ax = add_box(h=0.06)
     txt = TextBox(txt_ax, "Speed m/s:", initial=f"{state['v_mps']:.0f}")
 
     # Simulation range sliders (compact)
-    sim_z_ax  = add_box(h=0.05)
-    sl_sim_z  = Slider(sim_z_ax, "Sim z_max ×N", 0.5, 4.0, valinit=state["sim_z_multN"])
-    sim_x_ax  = add_box(h=0.05)
-    sl_sim_x  = Slider(sim_x_ax, "Sim width ×D", 2.0, 8.0, valinit=state["sim_span_multD"])
+    sim_z_ax = add_box(h=0.05)
+    sl_sim_z = Slider(sim_z_ax, "Sim z_max ×N", 0.5, 4.0, valinit=state["sim_z_multN"])
+    sim_x_ax = add_box(h=0.05)
+    sl_sim_x = Slider(sim_x_ax, "Sim width ×D", 2.0, 8.0, valinit=state["sim_span_multD"])
 
     # Toggles
     chk_ax = add_box(h=0.08)
-    chk = CheckButtons(chk_ax, ["Intensity ÷2", "Show Hz axis"],
-                       [state["intensity_case"], state["use_speed"]])
+    chk = CheckButtons(chk_ax, ["Show Hz axis"], [state["use_speed"]])
 
     # Buttons
     btn_line_ax = add_box(h=0.06)
@@ -394,7 +404,8 @@ def main():
             "  Rayleigh length: N_mm ≈ D^2 / (4 * lambda_field_mm)",
         ]
         fig2 = plt.figure(figsize=(8, 6))
-        ax2 = fig2.add_subplot(111); ax2.axis("off")
+        ax2 = fig2.add_subplot(111);
+        ax2.axis("off")
         ax2.text(0.02, 0.98, "\n".join(eq), va="top", ha="left",
                  family="monospace", fontsize=10)
         fig2.suptitle("Equations used", fontsize=12)
@@ -406,8 +417,8 @@ def main():
     # ---- Processing helpers ----
     def compute_filtered_image():
         g0 = state["gray0"]
-        g_bg = gaussian_background_subtract(g0, state["bg_mm"], state["mm_per_px"])
-        g_f = bandpass_2d_fft(g_bg, state["mm_per_px"], state["low_cmm"], state["high_cmm"])
+        # Band-pass only by INTENSITY frequency range mapped to spatial c/mm
+        g_f = bandpass_2d_fft(g0, state["mm_per_px"], state["low_cmm"], state["high_cmm"])
         return normalize01(g_f), g_f  # (disp, filtered)
 
     def spectrum_from_line(g_filtered_disp):
@@ -432,31 +443,36 @@ def main():
         v = state["v_mps"] if state["use_speed"] else None
         f_field = f_int = None
         if v and np.isfinite(lam_direct):
-            lam_d_m = lam_direct * 1e-3; lam_i_m = lam_int * 1e-3
+            lam_d_m = lam_direct * 1e-3;
+            lam_i_m = lam_int * 1e-3
             f_field = v / lam_d_m if lam_d_m > 0 else None
-            f_int   = v / lam_i_m if lam_i_m > 0 else None
+            f_int = v / lam_i_m if lam_i_m > 0 else None
         return fcmm, mag, fpk, lam_direct, lam_int, f_field, f_int
 
     def set_top_axis():
         if state["secax"] is not None:
-            try: state["secax"].remove()
-            except Exception: pass
+            try:
+                state["secax"].remove()
+            except Exception:
+                pass
             state["secax"] = None
         if not state["use_speed"] or (state["v_mps"] is None) or state["v_mps"] <= 0:
-            fig.canvas.draw_idle(); return
+            fig.canvas.draw_idle();
+            return
         v = state["v_mps"]
-        if state["intensity_case"]:
-            def cmm_to_Hz(x): return v * (x * 1000.0) / 2.0
-            def Hz_to_cmm(x): return (x * 2.0) / (v * 1000.0)
-            label = "Temporal frequency (Hz) — INTENSITY (÷2)"
-        else:
-            def cmm_to_Hz(x): return v * (x * 1000.0)
-            def Hz_to_cmm(x): return x / (v * 1000.0)
-            label = "Temporal frequency (Hz) — FIELD"
+
+        # INTENSITY mapping: f_intensity(Hz) = v * (nu_cmm * 1000) / 2
+        def cmm_to_Hz(x):
+            return v * (x * 1000.0) / 2.0
+
+        def Hz_to_cmm(x):
+            return (x * 2.0) / (v * 1000.0)
+
+        label = "Temporal frequency (Hz) — INTENSITY"
         sec = ax_spec.secondary_xaxis('top', functions=(cmm_to_Hz, Hz_to_cmm))
         sec.set_xlabel(label)
         sec.xaxis.set_major_formatter(mticker.FuncFormatter(
-            lambda val, _pos: f"{val/1e6:.3g} MHz" if abs(val) >= 1e6 else f"{val:.3g} Hz"
+            lambda val, _pos: f"{val / 1e6:.3g} MHz" if abs(val) >= 1e6 else f"{val:.3g} Hz"
         ))
         state["secax"] = sec
         fig.canvas.draw_idle()
@@ -479,8 +495,8 @@ def main():
             f"λ_intensity  : {lam_int:.4g} mm",
             f"λ_from f_int : {lam_from_fint_mm:.4g} mm" if lam_from_fint_mm else "λ_from f_int : —",
             f"Speed (m/s)  : {state['v_mps']:.4g} {'[ON]' if state['use_speed'] else '[OFF]'}",
-            f"f_field      : {f_field/1e6:.4g} MHz" if f_field is not None else "f_field      : —",
-            f"f_intensity  : {f_int/1e6:.4g} MHz" if f_int is not None else "f_intensity  : —",
+            f"f_field      : {f_field / 1e6:.4g} MHz" if f_field is not None else "f_field      : —",
+            f"f_intensity  : {f_int / 1e6:.4g} MHz" if f_int is not None else "f_intensity  : —",
             f"D (diameter) : {state['D_mm']:.4g} mm" if state['D_mm'] else "D (diameter) : —",
             f"N (near fld) : {N_mm:.4g} mm" if N_mm else "N (near fld) : —",
         ]
@@ -488,22 +504,43 @@ def main():
 
     # ---- Redraw pipeline ----
     def update_all(_=None):
-        # keep low <= high
-        low = float(sl_low.val); high = float(sl_high.val)
-        if high <= low + 1e-9:
-            high = min(low + 1e-6, state["nyq_cmm"]); sl_high.set_val(high)
-        state["bg_mm"] = float(sl_bg.val); state["low_cmm"] = low; state["high_cmm"] = high
-        state["sim_z_multN"]  = float(sl_sim_z.val)
+        # read intensity frequency range (MHz) and convert to spatial c/mm using speed
+        fmin = float(sl_fmin.val)
+        fmax = float(sl_fmax.val)
+        if fmax <= fmin + 1e-12:
+            fmax = min(fmin + 0.01, 10.0);
+            sl_fmax.set_val(fmax)
+        state["fmin_MHz"], state["fmax_MHz"] = fmin, fmax
+
+        v = state["v_mps"] if state["use_speed"] else None
+        if (v is None) or (v <= 0):
+            # if no valid speed, disable filtering
+            low_cmm = 0.0
+            high_cmm = state["nyq_cmm"]
+        else:
+            # f_intensity(Hz) -> spatial cycles/mm: ν = (2 f) / (1000 v)
+            low_cmm = (2.0 * fmin * 1e6) / (1000.0 * v)
+            high_cmm = (2.0 * fmax * 1e6) / (1000.0 * v)
+            # clip to Nyquist
+            low_cmm = max(0.0, min(low_cmm, state["nyq_cmm"]))
+            high_cmm = max(0.0, min(high_cmm, state["nyq_cmm"]))
+            if high_cmm <= low_cmm + 1e-12:
+                high_cmm = min(low_cmm + 1e-6, state["nyq_cmm"])
+        state["low_cmm"], state["high_cmm"] = low_cmm, high_cmm
+
+        state["sim_z_multN"] = float(sl_sim_z.val)
         state["sim_span_multD"] = float(sl_sim_x.val)
 
         disp, _ = compute_filtered_image()
 
         # Image (top) — native pixels, no scaling
         ax_img.clear()
-        try: ax_img.set_box_aspect(img_box_aspect)
-        except Exception: pass
+        try:
+            ax_img.set_box_aspect(img_box_aspect)
+        except Exception:
+            pass
         ax_img.imshow(disp, cmap="gray", interpolation="nearest", aspect="equal")
-        ax_img.set_title("Filtered image (native pixel size)")
+        ax_img.set_title("Filtered image (f_int range)")
         ax_img.set_axis_off()
         # line overlay
         if state["line_pts"] is not None:
@@ -517,7 +554,7 @@ def main():
             ax_img.scatter([dx0, dx1], [dy0, dy1], c="lime", s=40)
         # hint
         hint_txt = "Click TWO points to set the LINE" if state["selecting_line"] else \
-                   "Click TWO points to measure DIAMETER" if state["selecting_diam"] else ""
+            "Click TWO points to measure DIAMETER" if state["selecting_diam"] else ""
         state["hint_text"].set_text(hint_txt)
         state["hint_text"].set_visible(bool(hint_txt))
 
@@ -529,37 +566,43 @@ def main():
         ax_spec.set_xlim(0, state["nyq_cmm"])
         ax_spec.grid(True, alpha=0.3)
 
-        fpk = 0.0; lam_direct = np.inf; lam_int = np.inf; f_field = None; f_int = None
+        fpk = 0.0;
+        lam_direct = np.inf;
+        lam_int = np.inf;
+        f_field = None;
+        f_int = None
         out = spectrum_from_line(disp)
         if out is not None:
             fc, mag, fpk, lam_direct, lam_int, f_field, f_int = out
             ax_spec.plot(fc, mag, lw=1.8)
             if np.isfinite(fpk) and fpk > 0:
                 ax_spec.axvline(fpk, ls="--", lw=1)
-                ax_spec.text(fpk, max(mag)*0.9,
-                             f"peak ≈ {fpk:.3g} c/mm\nλ={lam_direct:.3g} mm (direct)\nλ={lam_int:.3g} mm (int)",
-                             rotation=90, va="top", ha="right", fontsize=9)
+                ytext = (max(mag) if len(mag) else 1.0) * 0.9
+                ax_spec.text(
+                    fpk, ytext,
+                    f"""peak ≈ {fpk:.3g} c/mm
+λ={lam_direct:.3g} mm (direct)
+λ={lam_int:.3g} mm (int)""",
+                    rotation=90, va="top", ha="right", fontsize=9
+                )
         set_top_axis()
         update_metrics(fpk, lam_direct, lam_int, f_field, f_int)
 
-        # Simulation (bottom) – redraw last computed result (if any)
+        # Simulation (bottom)
         ax_sim.clear()
         ax_sim.set_title("Near/Far field simulation (x–z, normalized intensity)")
         ax_sim.set_xlabel("Lateral position x (mm)")
         ax_sim.set_ylabel("Axial distance z (mm)")
         if (state["sim_Ixz"] is not None) and (state["sim_x"] is not None) and (state["sim_z"] is not None):
-            # Show in dB for detail; clip dynamic range
             Ixz = np.clip(state["sim_Ixz"], 1e-6, 1.0)
-            im = ax_sim.imshow(10.0*np.log10(Ixz),
+            im = ax_sim.imshow(10.0 * np.log10(Ixz),
                                extent=[state["sim_x"][0], state["sim_x"][-1],
                                        state["sim_z"][-1], state["sim_z"][0]],
                                aspect="auto", cmap="viridis")
-            # Mark near-field boundary
             N_mm = near_field_length(state["D_mm"], lam_int if np.isfinite(lam_int) else None)
             if N_mm and np.isfinite(N_mm):
                 ax_sim.axhline(N_mm, color="w", lw=1.2, ls="--")
                 ax_sim.text(state["sim_x"][0], N_mm, "  Rayleigh N", color="w", va="bottom", ha="left")
-            # Add thin colorbar within left column (won't cover controls)
             cax = fig.add_axes([ax_sim.get_position().x1 + 0.004,
                                 ax_sim.get_position().y0,
                                 0.01,
@@ -577,19 +620,18 @@ def main():
         except ValueError:
             state["v_mps"] = None
         update_all()
+
     txt.on_submit(on_speed_submit)
 
     def on_check_clicked(label):
-        if label == "Intensity ÷2":
-            state["intensity_case"] = not state["intensity_case"]
-        elif label == "Show Hz axis":
+        if label == "Show Hz axis":
             state["use_speed"] = not state["use_speed"]
         update_all()
+
     chk.on_clicked(on_check_clicked)
 
-    sl_bg.on_changed(update_all)
-    sl_low.on_changed(update_all)
-    sl_high.on_changed(update_all)
+    sl_fmin.on_changed(update_all)
+    sl_fmax.on_changed(update_all)
     sl_sim_z.on_changed(lambda _v: None)
     sl_sim_x.on_changed(lambda _v: None)
 
@@ -666,6 +708,7 @@ def main():
 
     # Mouse clicks for selections
     click_buffer = []
+
     def on_mouse_click(event):
         if event.inaxes != ax_img or event.xdata is None or event.ydata is None:
             return
@@ -688,7 +731,8 @@ def main():
                 click_buffer.clear()
                 state["selecting_diam"] = False
                 # compute D in mm
-                dx = p1[0] - p0[0]; dy = p1[1] - p0[1]
+                dx = p1[0] - p0[0];
+                dy = p1[1] - p0[1]
                 d_px = float(np.hypot(dx, dy))
                 state["D_mm"] = d_px * state["mm_per_px"]
                 update_all()
