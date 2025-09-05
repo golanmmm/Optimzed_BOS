@@ -240,6 +240,8 @@ def main():
         "selecting_line": False,
         "selecting_diam": False,
         "hint_text": None,
+        # Beam scan overlay
+        "beam_amp": None,
         # Simulation cache
         "sim_x": None, "sim_z": None, "sim_Ixz": None, "sim_Iaxis": None,
         "sim_z_multN": 2.0,  # z max = sim_z_multN * N
@@ -363,6 +365,13 @@ def main():
 
     btn_eq_ax = add_box(h=0.06)
     btn_eq = Button(btn_eq_ax, "Show equations")
+
+    # Beam scan buttons
+    btn_beam_ax = add_box(h=0.06)
+    btn_beam = Button(btn_beam_ax, "Beam scan")
+
+    btn_clear_ax = add_box(h=0.06)
+    btn_clear = Button(btn_clear_ax, "Clear beam")
 
     # ---- Equations popup ----
     def show_equations(_event=None):
@@ -558,6 +567,15 @@ def main():
         state["hint_text"].set_text(hint_txt)
         state["hint_text"].set_visible(bool(hint_txt))
 
+        # Beam overlay (if available)
+        if state.get("beam_amp") is not None:
+            amp = state["beam_amp"]
+            ax_img.imshow(amp, cmap="plasma", alpha=0.45, interpolation="nearest")
+            try:
+                ax_img.contour(amp, levels=[0.5], colors=["cyan"], linewidths=1.2)
+            except Exception:
+                pass
+
         # Spectrum (middle)
         ax_spec.clear()
         ax_spec.set_title("1D FFT along selected line")
@@ -705,6 +723,107 @@ def main():
         fig.canvas.draw_idle()
 
     btn_sim.on_clicked(run_simulation)
+
+    # ---- Beam scan helpers ----
+    def _moving_avg(a, win):
+        win = int(max(1, win))
+        if win == 1:
+            return a.astype(np.float32)
+        k = np.ones(win, dtype=np.float32) / float(win)
+        return np.convolve(a.astype(np.float32), k, mode='same')
+
+    def _target_spatial_cmm():
+        # prefer slider center (requires valid speed); fallback to measured peak on line
+        v = state["v_mps"] if state["use_speed"] else None
+        if v and v > 0:
+            f0 = 0.5 * (state["fmin_MHz"] + state["fmax_MHz"]) * 1e6
+            return (2.0 * f0) / (1000.0 * v)
+        # fallback: from spectrum of current line
+        disp, _ = compute_filtered_image()
+        out = spectrum_from_line(disp)
+        if out is None:
+            return None
+        _, _, fpk, *_ = out
+        return fpk if (fpk is not None and np.isfinite(fpk) and fpk > 0) else None
+
+    def run_beam_scan(_e=None):
+        # Validate prerequisites
+        if state["line_pts"] is None:
+            state["hint_text"].set_text("Select LINE first (2 points)");
+            state["hint_text"].set_visible(True);
+            fig.canvas.draw_idle();
+            return
+        if state["D_mm"] is None:
+            state["hint_text"].set_text("Measure DIAMETER first (2 points)");
+            state["hint_text"].set_visible(True);
+            fig.canvas.draw_idle();
+            return
+        nu0_cmm = _target_spatial_cmm()
+        if (nu0_cmm is None) or (nu0_cmm <= 0):
+            state["hint_text"].set_text("Set speed or choose a valid freq range");
+            state["hint_text"].set_visible(True);
+            fig.canvas.draw_idle();
+            return
+        nu0_cpx = nu0_cmm * state["mm_per_px"]
+        if nu0_cpx <= 0:
+            return
+
+        # Use filtered image for better SNR
+        _, g_f = compute_filtered_image()
+        Hh, Ww = g_f.shape
+        amp_map = np.zeros_like(g_f, dtype=np.float32)
+
+        # Scan geometry
+        (x0, y0), (x1, y1) = state["line_pts"]
+        dx, dy = (x1 - x0), (y1 - y0)
+        L_line = float(np.hypot(dx, dy))
+        if L_line < 8:
+            return
+        ux, uy = dx / L_line, dy / L_line
+        nx, ny = -uy, ux
+
+        max_off = int(np.hypot(Hh, Ww))
+        step = 1  # px
+        # Smoothing window ≈ 4 cycles
+        win = int(max(9, min(301, round(4.0 / max(nu0_cpx, 1e-6)))))
+
+        for o in range(-max_off, max_off + 1, step):
+            sx0, sy0 = x0 + o * nx, y0 + o * ny
+            sx1, sy1 = x1 + o * nx, y1 + o * ny
+            prof = profile_line(g_f, (sy0, sx0), (sy1, sx1), mode="reflect", order=1, linewidth=1, reduce_func=None)
+            if getattr(prof, "ndim", 1) > 1:
+                prof = prof.mean(axis=1)
+            Lp = len(prof)
+            if Lp < 16:
+                continue
+            x = np.arange(Lp, dtype=np.float32)
+            phase = 2.0 * np.pi * nu0_cpx * x
+            I = prof * np.cos(phase)
+            Q = prof * np.sin(phase)
+            I_s = _moving_avg(I, win)
+            Q_s = _moving_avg(Q, win)
+            A = np.sqrt(I_s * I_s + Q_s * Q_s).astype(np.float32)
+            xs = np.linspace(sx0, sx1, Lp)
+            ys = np.linspace(sy0, sy1, Lp)
+            xi = np.clip(np.rint(xs).astype(int), 0, Ww - 1)
+            yi = np.clip(np.rint(ys).astype(int), 0, Hh - 1)
+            # accumulate with max
+            np.maximum.at(amp_map, (yi, xi), A)
+
+        # Smooth a bit and normalize
+        try:
+            amp_map = gaussian(amp_map, sigma=1.0, preserve_range=True)
+        except Exception:
+            pass
+        state["beam_amp"] = normalize01(amp_map)
+        update_all()
+
+    def clear_beam(_e=None):
+        state["beam_amp"] = None
+        update_all()
+
+    btn_beam.on_clicked(run_beam_scan)
+    btn_clear.on_clicked(clear_beam)
 
     # Mouse clicks for selections
     click_buffer = []
